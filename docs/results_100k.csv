@@ -1,0 +1,175 @@
+kind,dataset,parameter,source,model,value,metric,valid
+per_parameter,BD,R0,Paper CNN,2-gen,0.0700,MRE,yes
+per_parameter,BD,R0,Paper CNN,1-gen,0.0690,MRE,yes
+per_parameter,BD,R0,Paper CNN,no context,0.0690,MRE,yes
+per_parameter,BD,infectious period,Paper CNN,2-gen,0.0650,MRE,yes
+per_parameter,BD,infectious period,Paper CNN,1-gen,0.0640,MRE,yes
+per_parameter,BD,infectious period,Paper CNN,no context,0.0640,MRE,yes
+per_parameter,BDEI,R0,Paper CNN,2-gen,0.0780,MRE,yes
+per_parameter,BDEI,R0,Paper CNN,1-gen,0.0760,MRE,yes
+per_parameter,BDEI,R0,Paper CNN,no context,0.0800,MRE,yes
+per_parameter,BDEI,infectious period,Paper CNN,2-gen,0.0850,MRE,yes
+per_parameter,BDEI,infectious period,Paper CNN,1-gen,0.0850,MRE,yes
+per_parameter,BDEI,infectious period,Paper CNN,no context,0.0890,MRE,yes
+per_parameter,BDEI,incubation period,Paper CNN,2-gen,0.1050,MRE,yes
+per_parameter,BDEI,incubation period,Paper CNN,1-gen,0.1100,MRE,yes
+per_parameter,BDEI,incubation period,Paper CNN,no context,0.1300,MRE,yes
+per_parameter,BDSS,R0,Paper CNN,2-gen,0.0840,MRE,yes
+per_parameter,BDSS,R0,Paper CNN,1-gen,0.0840,MRE,yes
+per_parameter,BDSS,R0,Paper CNN,no context,0.0840,MRE,yes
+per_parameter,BDSS,infectious period,Paper CNN,2-gen,0.0770,MRE,yes
+per_parameter,BDSS,infectious period,Paper CNN,1-gen,0.0770,MRE,yes
+per_parameter,BDSS,infectious period,Paper CNN,no context,0.0780,MRE,yes
+per_parameter,BDSS,transmission factor,Paper CNN,2-gen,0.1280,MRE,yes
+per_parameter,BDSS,transmission factor,Paper CNN,1-gen,0.1300,MRE,yes
+per_parameter,BDSS,transmission factor,Paper CNN,no context,0.1350,MRE,yes
+per_parameter,BDSS,superspreader fraction,Paper CNN,2-gen,0.2390,MRE,yes
+per_parameter,BDSS,superspreader fraction,Paper CNN,1-gen,0.2400,MRE,yes
+per_parameter,BDSS,superspreader fraction,Paper CNN,no context,0.2520,MRE,yes
+per_parameter,BiSSE,lambda_1,Paper CNN,2-gen,0.0310,MAE,yes
+per_parameter,BiSSE,lambda_1,Paper CNN,1-gen,0.0300,MAE,yes
+per_parameter,BiSSE,lambda_1,Paper CNN,no context,0.0300,MAE,yes
+per_parameter,BiSSE,lambda_2,Paper CNN,2-gen,0.0310,MAE,yes
+per_parameter,BiSSE,lambda_2,Paper CNN,1-gen,0.0320,MAE,yes
+per_parameter,BiSSE,lambda_2,Paper CNN,no context,0.0310,MAE,yes
+per_parameter,BiSSE,q_01,Paper CNN,2-gen,0.0040,MAE,yes
+per_parameter,BiSSE,q_01,Paper CNN,1-gen,0.0039,MAE,yes
+per_parameter,BiSSE,q_01,Paper CNN,no context,0.0039,MAE,yes
+per_parameter,BD,R0,Pretrained CNN,2-gen,0.4417,MRE,no
+per_parameter,BD,R0,Pretrained CNN,1-gen,0.2543,MRE,no
+per_parameter,BD,R0,Pretrained CNN,no context,0.0728,MRE,yes
+per_parameter,BD,infectious period,Pretrained CNN,2-gen,0.3692,MRE,no
+per_parameter,BD,infectious period,Pretrained CNN,1-gen,0.1653,MRE,no
+per_parameter,BD,infectious period,Pretrained CNN,no context,0.0665,MRE,yes
+per_parameter,BDEI,R0,Pretrained CNN,2-gen,0.0815,MRE,yes
+per_parameter,BDEI,R0,Pretrained CNN,1-gen,0.0801,MRE,yes
+per_parameter,BDEI,R0,Pretrained CNN,no context,0.0822,MRE,yes
+per_parameter,BDEI,infectious period,Pretrained CNN,2-gen,0.0995,MRE,yes
+per_parameter,BDEI,infectious period,Pretrained CNN,1-gen,0.0946,MRE,yes
+per_parameter,BDEI,infectious period,Pretrained CNN,no context,0.0893,MRE,yes
+per_parameter,BDEI,incubation period,Pretrained CNN,2-gen,0.1320,MRE,yes
+per_parameter,BDEI,incubation period,Pretrained CNN,1-gen,0.1235,MRE,yes
+per_parameter,BDEI,incubation period,Pretrained CNN,no context,0.1276,MRE,yes
+per_parameter,BDSS,R0,Pretrained CNN,2-gen,0.0858,MRE,yes
+per_parameter,BDSS,R0,Pretrained CNN,1-gen,0.0855,MRE,yes
+per_parameter,BDSS,R0,Pretrained CNN,no context,0.0852,MRE,yes
+per_parameter,BDSS,infectious period,Pretrained CNN,2-gen,0.0763,MRE,yes
+per_parameter,BDSS,infectious period,Pretrained CNN,1-gen,0.0770,MRE,yes
+per_parameter,BDSS,infectious period,Pretrained CNN,no context,0.0764,MRE,yes
+per_parameter,BDSS,transmission factor,Pretrained CNN,2-gen,0.1393,MRE,yes
+per_parameter,BDSS,transmission factor,Pretrained CNN,1-gen,0.1391,MRE,yes
+per_parameter,BDSS,transmission factor,Pretrained CNN,no context,0.1338,MRE,yes
+per_parameter,BDSS,superspreader fraction,Pretrained CNN,2-gen,0.2493,MRE,yes
+per_parameter,BDSS,superspreader fraction,Pretrained CNN,1-gen,0.2397,MRE,yes
+per_parameter,BDSS,superspreader fraction,Pretrained CNN,no context,0.2479,MRE,yes
+per_parameter,BiSSE,lambda_1,Pretrained CNN,2-gen,0.5335,MAE,no
+per_parameter,BiSSE,lambda_1,Pretrained CNN,1-gen,0.2264,MAE,no
+per_parameter,BiSSE,lambda_1,Pretrained CNN,no context,0.3251,MAE,no
+per_parameter,BiSSE,lambda_2,Pretrained CNN,2-gen,0.2514,MAE,no
+per_parameter,BiSSE,lambda_2,Pretrained CNN,1-gen,0.1829,MAE,no
+per_parameter,BiSSE,lambda_2,Pretrained CNN,no context,0.3014,MAE,no
+per_parameter,BiSSE,q_01,Pretrained CNN,2-gen,0.0326,MAE,no
+per_parameter,BiSSE,q_01,Pretrained CNN,1-gen,0.0289,MAE,no
+per_parameter,BiSSE,q_01,Pretrained CNN,no context,0.0528,MAE,no
+per_parameter,BD,R0,GNN 100K,GCN,0.0716,MRE,yes
+per_parameter,BD,R0,GNN 100K,GraphSAGE,0.0719,MRE,yes
+per_parameter,BD,R0,GNN 100K,GIN,0.0712,MRE,yes
+per_parameter,BD,R0,GNN 100K,GINE,0.0716,MRE,yes
+per_parameter,BD,R0,GNN 100K,Graph Transformer,0.0721,MRE,yes
+per_parameter,BD,infectious period,GNN 100K,GCN,0.0664,MRE,yes
+per_parameter,BD,infectious period,GNN 100K,GraphSAGE,0.0673,MRE,yes
+per_parameter,BD,infectious period,GNN 100K,GIN,0.0669,MRE,yes
+per_parameter,BD,infectious period,GNN 100K,GINE,0.0651,MRE,yes
+per_parameter,BD,infectious period,GNN 100K,Graph Transformer,0.0658,MRE,yes
+per_parameter,BDEI,R0,GNN 100K,GCN,0.3987,MRE,yes
+per_parameter,BDEI,R0,GNN 100K,GraphSAGE,0.3433,MRE,yes
+per_parameter,BDEI,R0,GNN 100K,GAT,0.5448,MRE,yes
+per_parameter,BDEI,R0,GNN 100K,GIN,0.5111,MRE,yes
+per_parameter,BDEI,R0,GNN 100K,GINE,0.2777,MRE,yes
+per_parameter,BDEI,R0,GNN 100K,Graph Transformer,0.4635,MRE,yes
+per_parameter,BDEI,R0,GNN 100K,SAGE-GAT Fusion,0.4594,MRE,yes
+per_parameter,BDEI,infectious period,GNN 100K,GCN,0.6970,MRE,yes
+per_parameter,BDEI,infectious period,GNN 100K,GraphSAGE,0.7008,MRE,yes
+per_parameter,BDEI,infectious period,GNN 100K,GAT,0.7121,MRE,yes
+per_parameter,BDEI,infectious period,GNN 100K,GIN,0.7316,MRE,yes
+per_parameter,BDEI,infectious period,GNN 100K,GINE,0.6482,MRE,yes
+per_parameter,BDEI,infectious period,GNN 100K,Graph Transformer,0.5369,MRE,yes
+per_parameter,BDEI,infectious period,GNN 100K,SAGE-GAT Fusion,0.6436,MRE,yes
+per_parameter,BDEI,incubation period,GNN 100K,GCN,0.8011,MRE,yes
+per_parameter,BDEI,incubation period,GNN 100K,GraphSAGE,0.7928,MRE,yes
+per_parameter,BDEI,incubation period,GNN 100K,GAT,0.7380,MRE,yes
+per_parameter,BDEI,incubation period,GNN 100K,GIN,0.7526,MRE,yes
+per_parameter,BDEI,incubation period,GNN 100K,GINE,0.7139,MRE,yes
+per_parameter,BDEI,incubation period,GNN 100K,Graph Transformer,0.7957,MRE,yes
+per_parameter,BDEI,incubation period,GNN 100K,SAGE-GAT Fusion,0.8048,MRE,yes
+per_parameter,BDSS,R0,GNN 100K,GCN,0.0854,MRE,yes
+per_parameter,BDSS,R0,GNN 100K,GraphSAGE,0.0844,MRE,yes
+per_parameter,BDSS,R0,GNN 100K,GAT,0.0876,MRE,yes
+per_parameter,BDSS,R0,GNN 100K,GIN,0.0869,MRE,yes
+per_parameter,BDSS,R0,GNN 100K,GINE,0.0869,MRE,yes
+per_parameter,BDSS,R0,GNN 100K,Graph Transformer,0.0853,MRE,yes
+per_parameter,BDSS,R0,GNN 100K,SAGE-GAT Fusion,0.0830,MRE,yes
+per_parameter,BDSS,infectious period,GNN 100K,GCN,0.0760,MRE,yes
+per_parameter,BDSS,infectious period,GNN 100K,GraphSAGE,0.0758,MRE,yes
+per_parameter,BDSS,infectious period,GNN 100K,GAT,0.0807,MRE,yes
+per_parameter,BDSS,infectious period,GNN 100K,GIN,0.0800,MRE,yes
+per_parameter,BDSS,infectious period,GNN 100K,GINE,0.0828,MRE,yes
+per_parameter,BDSS,infectious period,GNN 100K,Graph Transformer,0.0769,MRE,yes
+per_parameter,BDSS,infectious period,GNN 100K,SAGE-GAT Fusion,0.0758,MRE,yes
+per_parameter,BDSS,transmission factor,GNN 100K,GCN,0.1321,MRE,yes
+per_parameter,BDSS,transmission factor,GNN 100K,GraphSAGE,0.1299,MRE,yes
+per_parameter,BDSS,transmission factor,GNN 100K,GAT,0.1292,MRE,yes
+per_parameter,BDSS,transmission factor,GNN 100K,GIN,0.1310,MRE,yes
+per_parameter,BDSS,transmission factor,GNN 100K,GINE,0.1304,MRE,yes
+per_parameter,BDSS,transmission factor,GNN 100K,Graph Transformer,0.1308,MRE,yes
+per_parameter,BDSS,transmission factor,GNN 100K,SAGE-GAT Fusion,0.1299,MRE,yes
+per_parameter,BDSS,superspreader fraction,GNN 100K,GCN,0.2488,MRE,yes
+per_parameter,BDSS,superspreader fraction,GNN 100K,GraphSAGE,0.2484,MRE,yes
+per_parameter,BDSS,superspreader fraction,GNN 100K,GAT,0.2501,MRE,yes
+per_parameter,BDSS,superspreader fraction,GNN 100K,GIN,0.2511,MRE,yes
+per_parameter,BDSS,superspreader fraction,GNN 100K,GINE,0.2420,MRE,yes
+per_parameter,BDSS,superspreader fraction,GNN 100K,Graph Transformer,0.2513,MRE,yes
+per_parameter,BDSS,superspreader fraction,GNN 100K,SAGE-GAT Fusion,0.2726,MRE,yes
+per_parameter,BiSSE,turnover,GNN 100K,GCN,0.0868,MAE,yes
+per_parameter,BiSSE,turnover,GNN 100K,GraphSAGE,0.0860,MAE,yes
+per_parameter,BiSSE,turnover,GNN 100K,GIN,0.0873,MAE,yes
+per_parameter,BiSSE,turnover,GNN 100K,GINE,0.0871,MAE,yes
+per_parameter,BiSSE,lambda_1,GNN 100K,GCN,0.0405,MAE,yes
+per_parameter,BiSSE,lambda_1,GNN 100K,GraphSAGE,0.0400,MAE,yes
+per_parameter,BiSSE,lambda_1,GNN 100K,GIN,0.0417,MAE,yes
+per_parameter,BiSSE,lambda_1,GNN 100K,GINE,0.0395,MAE,yes
+per_parameter,BiSSE,lambda_2,GNN 100K,GCN,0.0371,MAE,yes
+per_parameter,BiSSE,lambda_2,GNN 100K,GraphSAGE,0.0371,MAE,yes
+per_parameter,BiSSE,lambda_2,GNN 100K,GIN,0.0372,MAE,yes
+per_parameter,BiSSE,lambda_2,GNN 100K,GINE,0.0400,MAE,yes
+per_parameter,BiSSE,q_01,GNN 100K,GCN,0.0040,MAE,yes
+per_parameter,BiSSE,q_01,GNN 100K,GraphSAGE,0.0040,MAE,yes
+per_parameter,BiSSE,q_01,GNN 100K,GIN,0.0038,MAE,yes
+per_parameter,BiSSE,q_01,GNN 100K,GINE,0.0039,MAE,yes
+nmae,BD,all,GNN 100K,GCN,0.1610,nMAE,yes
+nmae,BD,all,GNN 100K,GraphSAGE,0.1616,nMAE,yes
+nmae,BD,all,GNN 100K,GIN,0.1599,nMAE,yes
+nmae,BD,all,GNN 100K,GINE,0.1601,nMAE,yes
+nmae,BD,all,GNN 100K,Graph Transformer,0.1610,nMAE,yes
+nmae,BDEI,all,GNN 100K,GCN,1.5652,nMAE,yes
+nmae,BDEI,all,GNN 100K,GraphSAGE,1.5354,nMAE,yes
+nmae,BDEI,all,GNN 100K,GAT,1.4599,nMAE,yes
+nmae,BDEI,all,GNN 100K,GIN,1.6225,nMAE,yes
+nmae,BDEI,all,GNN 100K,GINE,1.4176,nMAE,yes
+nmae,BDEI,all,GNN 100K,Graph Transformer,1.5711,nMAE,yes
+nmae,BDEI,all,GNN 100K,SAGE-GAT Fusion,1.5211,nMAE,yes
+nmae,BDSS,all,GNN 100K,GCN,0.3460,nMAE,yes
+nmae,BDSS,all,GNN 100K,GraphSAGE,0.3424,nMAE,yes
+nmae,BDSS,all,GNN 100K,GAT,0.3441,nMAE,yes
+nmae,BDSS,all,GNN 100K,GIN,0.3457,nMAE,yes
+nmae,BDSS,all,GNN 100K,GINE,0.3446,nMAE,yes
+nmae,BDSS,all,GNN 100K,Graph Transformer,0.3427,nMAE,yes
+nmae,BDSS,all,GNN 100K,SAGE-GAT Fusion,0.3512,nMAE,yes
+nmae,BiSSE,all,GNN 100K,GCN,0.1963,nMAE,yes
+nmae,BiSSE,all,GNN 100K,GraphSAGE,0.1956,nMAE,yes
+nmae,BiSSE,all,GNN 100K,GIN,0.1964,nMAE,yes
+nmae,BiSSE,all,GNN 100K,GINE,0.1977,nMAE,yes
+primates,BiSSE,logL,Maximum likelihood,BiSSE ML,-846.93,logL,yes
+primates,BiSSE,logL,GNN 100K,GCN,-849.16,logL,yes
+primates,BiSSE,logL,Paper CNN,2-gen,-850.06,logL,yes
+primates,BiSSE,logL,GNN 100K,GraphSAGE,-850.44,logL,yes

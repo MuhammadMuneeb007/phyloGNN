@@ -26,8 +26,77 @@ inputs, caching, metrics) and `GNNArchitectures.py` (the 12 PyTorch Geometric ar
 
 ---
 
+## Results — 100,000-tree experiment
+
+GNNs trained on **100,000 simulated trees per model**, tested on the authors' independent test sets
+(BD 10,000, BDEI 9,998, BDSS 10,000, BiSSE 1,000 trees). Compared with:
+
+* **Paper CNN** — values published in the PhyloCNN paper for its 100K training set (best of the three
+  PhyloCNN variants per parameter; the paper tested on 1,000 selected trees, so this comparison is
+  descriptive, not a paired test);
+* **Pretrained CNN** — the authors' released models run by Step 7 on the same test trees as our GNNs
+  (only models that pass the reproduction check: BD no-context, all BDEI and BDSS; no BiSSE model passes).
+
+Errors use the paper's measures — **MRE** (mean relative error) for BD, BDEI, BDSS and **MAE** for
+BiSSE — and **lower is better**. 23 of the 48 GNN runs (12 architectures × 4 models) had finished when
+these results were taken; unfinished architectures are not shown.
+
+**Best result per model of evolution** (error averaged over the parameters):
+
+| Dataset | Measure | Paper CNN (best variant) | Pretrained CNN (best valid) | Best GNN, 100K | GNN vs paper |
+|---|---|---|---|---|---|
+| BD | MRE | 0.0665 (1-gen / no context) | 0.0697 (no context) | **0.0683** (GINE) | +2.8% |
+| BDSS | MRE | 0.1320 (2-gen) | 0.1353 (1-gen) | **0.1346** (GraphSAGE) | +2.0% |
+| BiSSE (λ1, λ2, q01) | MAE | 0.0216 (no context) | — (none valid) | 0.0270 (GraphSAGE) | +25.0% |
+| BDEI | MRE | 0.0893 (2-gen) | 0.0994 (1-gen) | 0.5466 (GINE) | +512% |
+
+![Error per parameter, 100K](docs/figures/fig_100k_per_parameter.png)
+
+**Per parameter, the best GNN is lower than the published PhyloCNN for** BDSS R0 (0.0830 vs 0.0840),
+BDSS infectious period (0.0758 vs 0.0770) and BiSSE q01 (0.0038 vs 0.0039), and lower than the
+pretrained CNN on the same trees for BD (0.0683 vs 0.0697) and BDSS (0.1346 vs 0.1353). It is higher for
+the BD parameters (by 1.7–3.2%), BDSS transmission factor and superspreader fraction, the BiSSE speciation
+rates (0.0395 / 0.0371 vs 0.030 / 0.031), and far higher for BDEI.
+
+![GNN architectures, 100K](docs/figures/fig_100k_architectures.png)
+
+**Architectures** (normalised MAE, the benchmark's ranking measure): GIN is best for BD (0.1599), GraphSAGE
+for BDSS (0.3424) and BiSSE (0.1956), GINE for BDEI (1.4176); the finished architectures lie within ~1–3%
+of each other on BD, BDSS and BiSSE.
+
+**Empirical trees** (100K GNNs; the true parameters are unknown):
+
+| Primates (BiSSE) | turnover | λ1 | λ2 | q01 | log-likelihood |
+|---|---|---|---|---|---|
+| Maximum likelihood | 0.7777 | 0.3947 | 0.2096 | 0.0126 | **−846.93** |
+| GNN GCN, 100K | 0.6473 | 0.3333 | 0.1768 | 0.0097 | −849.16 |
+| Paper CNN, 2-gen | 0.6104 | 0.3782 | 0.1662 | 0.0106 | −850.06 |
+| GNN GraphSAGE, 100K | 0.5707 | 0.3211 | 0.1625 | 0.0110 | −850.44 |
+
+![Primate likelihood](docs/figures/fig_100k_primates_likelihood.png)
+
+| HIV Zurich (BDSS) | R0 | infectious period (years) | transmission factor | superspreader fraction |
+|---|---|---|---|---|
+| Paper CNN, HIV-specific priors | 1.4124 | 11.3205 | 20.3906 | 0.1293 |
+| Pretrained CNN, HIV-specific priors | 1.3933 | 9.0492 | 19.4611 | 0.1198 |
+| GNN GraphSAGE, 100K (standard priors) | 1.4820 | 4.3692 | 10.3969 | 0.0372 |
+
+**In short:** at 100K the GNNs are competitive but not better overall — within 2–3% of the published
+PhyloCNN on BD and BDSS (slightly better than the pretrained CNN run on the same trees), better on three
+single parameters, worse on the BiSSE speciation rates, and they do not generalise on BDEI (validation
+nMAE 0.25 vs test 1.42 for GINE; under investigation). On the primate tree the GCN estimates fit the data
+better than the published PhyloCNN estimates (log-likelihood −849.16 vs −850.06), still below the maximum.
+The HIV estimates are not comparable to the published ones: those come from a model trained with
+HIV-specific (wider) priors.
+
+The numbers are in [`docs/results_100k.csv`](docs/results_100k.csv); the charts are drawn by
+`python docs/make_results_charts.py`. Step 6 and Step 7 produce the complete tables, statistical tests and
+figures for any results folder.
+
+---
+
 ## Contents
-[Models](#models-and-datasets) · [Requirements](#requirements) · [Quick start](#quick-start-all-commands) ·
+[Results](#results--100000-tree-experiment) · [Models](#models-and-datasets) · [Requirements](#requirements) · [Quick start](#quick-start-all-commands) ·
 [Step 1](#step-1--download-the-repositories) · [Step 2](#step-2--install-the-environments) ·
 [Step 3](#step-3--generate-the-data) · [Step 4](#step-4--train-and-test-the-models) ·
 [Step 4b](#step-4b--gnn-experiments-ablations) · [Step 5](#step-5--empirical-trees-hiv-and-primates) ·
