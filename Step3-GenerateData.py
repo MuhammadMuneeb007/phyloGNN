@@ -14,12 +14,30 @@ New runs:
   - Use the authors' original independent test archives.
   - Encode with original PhyloCNN functions.
   - Validate trees, parameters and encodings.
-  - Submit SLURM arrays with progress reporting.
 
 Existing runs:
   - Preserve Data/_step3/tasks.json and task IDs.
-  - Continue existing training/validation jobs.
-  - Skip redundant generated-test jobs.
+  - Completed chunks are verified and skipped.
+  - Legacy generated-test tasks are ignored.
+
+This script never calls sbatch. The SLURM array is Step3-GenerateData.sh;
+each array element runs ONE work item:
+
+  python Step3-GenerateData.py --task-id N
+
+  work items 0 .. T-1   training/validation simulation chunks (T = 800 by default)
+  work items T .. T+3   encoding of the authors' test sets (BD, BDEI, BDSS, BiSSE)
+
+The first array task prepares the run (parameter designs, chunks, task list)
+under a lock; the others wait for it. Preparation can also be run by hand.
+
+Commands (run from the project root):
+  python Step3-GenerateData.py --prepare          # optional; the array does it too
+  python Step3-GenerateData.py --pilot            # one tree per model, before sbatch
+  python Step3-GenerateData.py --array-range      # e.g. 0-803
+  sbatch Step3-GenerateData.sh
+  python Step3-GenerateData.py --status
+  python Step3-GenerateData.py --pending-array    # unfinished items, for a resume
 """
 
 from __future__ import annotations
@@ -32,12 +50,15 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import random
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import time
 import traceback
 
 from contextlib import ExitStack
@@ -56,7 +77,19 @@ CONTROL = DATA / "_step3"
 
 CONFIG = CONTROL / "config.json"
 TASKS = CONTROL / "tasks.json"
-JOBS = CONTROL / "jobs.json"
+PREPARE_LOCK = CONTROL / "prepare.lock"
+PREPARE_FAILED = CONTROL / "PREPARE_FAILED.json"
+
+# Bunya: array indices must be 0..999.
+MAX_ARRAY_INDEX = 999
+
+# A parameter row whose tree fails validation is re-simulated with new seeds.
+# Attempts 1-5 use the same seeds as before, so earlier rescues are unchanged.
+RESCUE_ATTEMPTS = 20
+
+# Rows that still fail are excluded (recorded in DONE.json). More than this
+# share of a chunk failing means something is systematically wrong.
+MAX_EXCLUDED_FRACTION = 0.02
 
 LOGS = CONTROL / "logs"
 SCRATCH = CONTROL / "scratch"
@@ -435,7 +468,7 @@ def write_design_chunk(path, rows, model):
 def load_tasks():
     if not TASKS.is_file():
         raise RuntimeError(
-            "Missing task manifest. Run --submit first."
+            "Missing task manifest. Run --prepare first."
         )
 
     return json_read(TASKS)
@@ -562,11 +595,6 @@ def prepare(args):
             "Training fraction must be between 0 and 1."
         )
 
-    if args.concurrency <= 0:
-        raise RuntimeError(
-            "Concurrency must be positive."
-        )
-
     # Preserve existing run and task IDs.
     if CONFIG.is_file():
         conf = json_read(CONFIG)
@@ -585,7 +613,8 @@ def prepare(args):
             if conf[key] != getattr(args, key):
                 raise RuntimeError(
                     f"Existing run uses different {key}. "
-                    "Use --resume with the existing run."
+                    "Keep the existing settings, or move "
+                    "Data/_step3 aside to start a new run."
                 )
 
         check_sources(conf)
@@ -1445,6 +1474,8 @@ def worker(task, conf, pilot=False):
         })
 
     try:
+        excluded = []
+
         # First attempt a bulk simulation.
         try:
             trees, stats, finals = simulate(
@@ -1491,7 +1522,9 @@ def worker(task, conf, pilot=False):
             trees, stats, finals = [], [], []
 
             for row in rows:
-                for retry in range(1, 6):
+                last_error = ""
+
+                for retry in range(1, RESCUE_ATTEMPTS + 1):
                     try:
                         tree, st, fin = rescue(
                             task,
@@ -1508,6 +1541,7 @@ def worker(task, conf, pilot=False):
                         break
 
                     except Exception as exc:
+                        last_error = str(exc)[:300]
                         log(
                             "[RETRY]",
                             row["index"],
@@ -1516,15 +1550,25 @@ def worker(task, conf, pilot=False):
                         )
 
                 else:
-                    raise RuntimeError(
-                        "Unable to simulate parameter "
-                        + row["index"]
-                    )
+                    # Keep the lists aligned; this row is excluded below.
+                    trees.append(None)
+                    stats.append(None)
+                    finals.append(None)
+                    excluded.append({
+                        "index": idx(row["index"]),
+                        "reason": "unable to simulate: " + last_error,
+                    })
+                    log("[EXCLUDED]", model, row["index"], last_error[:150])
 
-            rescued = len(rows)
+            rescued = len(rows) - len(excluded)
 
         # Independently validate each tree and its labels.
+        excluded_ids = {item["index"] for item in excluded}
+
         for i, row in enumerate(rows):
+            if idx(row["index"]) in excluded_ids:
+                continue
+
             try:
                 valid_tree(
                     trees[i],
@@ -1550,7 +1594,9 @@ def worker(task, conf, pilot=False):
                     str(error)[:150],
                 )
 
-                for retry in range(1, 6):
+                last_error = str(error)[:300]
+
+                for retry in range(1, RESCUE_ATTEMPTS + 1):
                     try:
                         (
                             trees[i],
@@ -1568,6 +1614,7 @@ def worker(task, conf, pilot=False):
                         break
 
                     except Exception as exc:
+                        last_error = str(exc)[:300]
                         log(
                             "[RETRY]",
                             row["index"],
@@ -1576,10 +1623,38 @@ def worker(task, conf, pilot=False):
                         )
 
                 else:
-                    raise RuntimeError(
-                        "Failed to rescue "
-                        + row["index"]
-                    )
+                    excluded.append({
+                        "index": idx(row["index"]),
+                        "reason": "failed validation after "
+                                  f"{RESCUE_ATTEMPTS} seeded attempts: "
+                                  + last_error,
+                    })
+                    excluded_ids.add(idx(row["index"]))
+                    log("[EXCLUDED]", model, row["index"], last_error[:150])
+
+        # A few unsimulatable parameter sets are dropped (and recorded);
+        # many would mean something is systematically wrong.
+        limit = int(MAX_EXCLUDED_FRACTION * len(rows))
+
+        if len(excluded) > limit:
+            raise RuntimeError(
+                f"{len(excluded)} of {len(rows)} rows could not be "
+                f"simulated (limit {limit}); first: "
+                + "; ".join(
+                    f"{e['index']}: {e['reason'][:80]}"
+                    for e in excluded[:3]
+                )
+            )
+
+        if excluded:
+            keep = [
+                i for i, row in enumerate(rows)
+                if idx(row["index"]) not in excluded_ids
+            ]
+            rows = [rows[i] for i in keep]
+            trees = [trees[i] for i in keep]
+            stats = [stats[i] for i in keep]
+            finals = [finals[i] for i in keep]
 
         # Nested subset only from train/validation.
         subsets = None
@@ -1615,7 +1690,11 @@ def worker(task, conf, pilot=False):
             "model": model,
             "split": task["split"],
             "chunk": task["chunk"],
-            "count": len(rows),
+            # count = parameter rows attempted (what complete() checks);
+            # kept = trees written; excluded = unsimulatable rows + reason.
+            "count": task["count"],
+            "kept": len(rows),
+            "excluded": excluded,
             "subset_count": selected,
             "rescued_trees": rescued,
             "seed": sim_seed(task, conf),
@@ -2184,7 +2263,7 @@ def status():
     if not CONFIG.is_file() or not TASKS.is_file():
         print(
             "No prepared run found. "
-            "Use --submit to prepare data."
+            "Run --prepare, or submit Step3-GenerateData.sh."
         )
         return
 
@@ -2222,10 +2301,14 @@ def status():
             if complete(task, conf)
         ]
 
-        finished = sum(
-            task["count"]
-            for task in verified
-        )
+        # Trees actually kept (excluded unsimulatable rows are not counted).
+        finished = 0
+        dropped = 0
+
+        for task in verified:
+            state = json_read(outdir(task, conf) / "DONE.json")
+            finished += state.get("kept", state["count"])
+            dropped += len(state.get("excluded", []))
 
         goal = sum(
             task["count"]
@@ -2274,6 +2357,7 @@ def status():
             f"{partial:>12,} "
             f"{len(verified):>4}/{len(items):<7} "
             f"{failed:>8}"
+            + (f"   ({dropped} unsimulatable rows excluded)" if dropped else "")
         )
 
         subset_count = sum(
@@ -2345,11 +2429,24 @@ def status():
             "PASS" if marker.is_file() else "PENDING",
         )
 
-    if JOBS.is_file():
+    pending = pending_items()
+
+    print(
+        f"\nWork items: {len(work_items(tasks))} "
+        f"(array {array_range(tasks)}); "
+        f"unfinished: {len(pending)}"
+    )
+
+    if pending:
         print(
-            "\nSLURM jobs:",
-            json_read(JOBS),
+            "Resume only unfinished items:\n"
+            "  sbatch --array="
+            f"{compact(pending)}%100 Step3-GenerateData.sh"
         )
+
+    print(
+        "SLURM queue: squeue -u $USER"
+    )
 
     print(
         "\nLegacy generated-test tasks are ignored. "
@@ -2358,7 +2455,7 @@ def status():
 
 
 # ============================================================
-# 20. SLURM ARRAY UTILITIES
+# 20. WORK ITEMS (ONE PER SLURM ARRAY ELEMENT)
 # ============================================================
 
 def compact(values):
@@ -2391,359 +2488,251 @@ def compact(values):
     return ",".join(spans)
 
 
-def sbatch(
-    args,
-    name,
-    array,
-    invocation,
-    dependency=None,
-):
-    if not shutil.which("sbatch"):
-        raise RuntimeError(
-            "SLURM sbatch is unavailable."
-        )
+def work_items(tasks):
+    """
+    Array index -> work item.
 
-    LOGS.mkdir(
-        parents=True, exist_ok=True
-    )
+    Training/validation chunks first (manifest order, task IDs
+    unchanged), then one author-test encoding item per model.
+    Legacy generated-test tasks are not work items.
+    """
 
-    command = [
-        "sbatch",
-        "--parsable",
-        "--job-name", name,
-        "--array", array,
-        "--partition", args.partition,
-        "--cpus-per-task", str(args.cpus),
-        "--mem", args.mem,
-        "--time", args.time,
-        "--chdir", str(ROOT),
-        "--output",
-        str(LOGS / f"{name}.%A_%a.out"),
-        "--error",
-        str(LOGS / f"{name}.%A_%a.err"),
+    trainval = [
+        ("trainval", task)
+        for task in tasks
+        if task["split"] == "trainval"
     ]
 
-    if dependency:
-        command.extend([
-            "--dependency",
-            "afterok:" + str(dependency),
-        ])
-
-    if invocation[-1] == "$SLURM_ARRAY_TASK_ID":
-        wrapped = shlex.join([
-            str(py()),
-            str(SCRIPT),
-            *invocation[:-1],
-        ])
-
-        wrapped += ' "$SLURM_ARRAY_TASK_ID"'
-
-    else:
-        wrapped = shlex.join([
-            str(py()),
-            str(SCRIPT),
-            *invocation,
-        ])
-
-    command.extend([
-        "--wrap",
-        wrapped,
-    ])
-
-    log(
-        "[SBATCH]",
-        shlex.join(command),
-    )
-
-    result = subprocess.run(
-        command,
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-
-    job_id = (
-        result.stdout.strip().split(";")[0]
-    )
-
-    log(
-        "[SUBMITTED]",
-        job_id,
-        name,
-    )
-
-    return job_id
-
-
-def active_generated_job():
-    if (
-        not JOBS.is_file()
-        or not shutil.which("squeue")
-    ):
-        return None
-
-    for job_id in json_read(JOBS).get("jobs", []):
-        result = subprocess.run(
-            [
-                "squeue",
-                "-h",
-                "-j",
-                str(job_id),
-            ],
-            text=True,
-            capture_output=True,
-        )
-
-        if (
-            result.returncode == 0
-            and result.stdout.strip()
-        ):
-            return job_id
-
-    return None
-
-
-# ============================================================
-# 21. SUBMIT TRAINING/VALIDATION JOBS
-# ============================================================
-
-def submit(args, conf, pilot_only=False):
-    if active_generated_job():
-        raise RuntimeError(
-            "A previous Step 3 SLURM job is still active. "
-            "Do not resubmit while it is running."
-        )
-
-    jobs = []
-
-    pilots_complete = all(
-        (
-            CONTROL
-            / "pilot_verified"
-            / model
-            / "DONE.json"
-        ).is_file()
+    author = [
+        ("author_test", model)
         for model in MODELS
+    ]
+
+    return trainval + author
+
+
+def expected_item_count(args):
+    """Number of work items, without preparing anything."""
+
+    if TASKS.is_file():
+        return len(work_items(load_tasks()))
+
+    chunks = math.ceil(args.n_full / args.chunk_size)
+
+    return len(MODELS) * chunks + len(MODELS)
+
+
+def array_range(tasks=None, args=None):
+    count = (
+        len(work_items(tasks))
+        if tasks is not None
+        else expected_item_count(args)
     )
 
-    if not pilots_complete:
-        job_id = sbatch(
-            args,
-            "Phylo_S3_PILOT",
-            "0-3%4",
-            [
-                "--pilot-worker",
-                "$SLURM_ARRAY_TASK_ID",
-            ],
+    return f"0-{count - 1}"
+
+
+def item_done(kind, item, conf):
+    if kind == "trainval":
+        return complete(item, conf)
+
+    return author_test_done(item) is not None
+
+
+def pending_items():
+    conf = json_read(CONFIG)
+
+    return [
+        number
+        for number, (kind, item) in enumerate(
+            work_items(load_tasks())
         )
+        if not item_done(kind, item, conf)
+    ]
 
-        jobs.append(job_id)
 
-    if not pilot_only:
-        # IMPORTANT: No replacement test simulations.
-        pending = [
-            task["id"]
-            for task in load_tasks()
-            if (
-                task["split"] == "trainval"
-                and not complete(task, conf)
-            )
-        ]
+# ============================================================
+# 21. ONE-TIME PREPARATION SHARED BY ALL ARRAY TASKS
+# ============================================================
 
-        if pending:
-            array = (
-                compact(pending)
-                + "%"
-                + str(args.concurrency)
-            )
+def ensure_prepared(args):
+    """
+    Return the run configuration, preparing it exactly once.
 
-            dependency = (
-                jobs[0] if jobs else None
-            )
+    The first array task creates Data/_step3/prepare.lock
+    (mkdir is atomic on cluster file systems) and prepares;
+    all others wait until config.json and tasks.json exist.
+    An existing run is always reused as it is.
+    """
 
-            job_id = sbatch(
-                args,
-                "Phylo_S3",
-                array,
-                [
-                    "--worker",
-                    "$SLURM_ARRAY_TASK_ID",
-                ],
-                dependency,
+    deadline = time.time() + args.prepare_wait * 60
+
+    while True:
+        if CONFIG.is_file() and TASKS.is_file():
+            return json_read(CONFIG)
+
+        if PREPARE_FAILED.is_file():
+            raise RuntimeError(
+                "Preparation failed in another task: "
+                f"{PREPARE_FAILED}. Fix the cause, delete "
+                "that file, and submit again."
             )
 
-            jobs.append(job_id)
+        CONTROL.mkdir(parents=True, exist_ok=True)
 
-        else:
-            log(
-                "[DONE]",
-                "All training/validation chunks verified."
+        try:
+            PREPARE_LOCK.mkdir()
+
+        except FileExistsError:
+            if time.time() > deadline:
+                raise RuntimeError(
+                    "Timed out waiting for preparation. If no "
+                    "task is preparing, delete "
+                    f"{PREPARE_LOCK} and submit again."
+                )
+
+            time.sleep(20 + random.random() * 10)
+            continue
+
+        try:
+            json_save(
+                PREPARE_LOCK / "owner.json",
+                {
+                    "host": socket.gethostname(),
+                    "slurm_job": os.environ.get(
+                        "SLURM_JOB_ID"
+                    ),
+                    "started": dt.datetime.now().isoformat(),
+                },
             )
 
-    json_save(
-        JOBS,
-        {
-            "jobs": jobs,
-            "submitted": (
-                dt.datetime.now().isoformat()
-            ),
-        },
-    )
+            if not (CONFIG.is_file() and TASKS.is_file()):
+                log("[PREPARE] This task prepares the run.")
+
+                try:
+                    prepare(args)
+
+                except Exception as error:
+                    json_save(
+                        PREPARE_FAILED,
+                        {
+                            "error": str(error),
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+
+                    raise
+
+            return json_read(CONFIG)
+
+        finally:
+            shutil.rmtree(PREPARE_LOCK, ignore_errors=True)
+
+
+def manual_prepare(args):
+    if PREPARE_FAILED.is_file():
+        PREPARE_FAILED.unlink()
+
+    conf = ensure_prepared(args)
+    tasks = load_tasks()
 
     print()
     print(
-        "Status: python Step3-GenerateData.py --status"
+        "Prepared:",
+        len(work_items(tasks)),
+        "work items. Submit with:"
     )
     print(
-        "SLURM:  squeue -u $USER"
+        f"  sbatch --array={array_range(tasks)}%100 "
+        "Step3-GenerateData.sh"
     )
-    print(
-        "Original tests: "
-        "python Step3-GenerateData.py "
-        "--encode-author-tests"
-    )
+
+    return conf
 
 
 # ============================================================
-# 22. SUBMIT AUTHOR TEST ENCODING
+# 22. ARRAY TASK ENTRY POINT
 # ============================================================
 
-def submit_author_tests(args):
-    check_sources()
-    check_author_archives()
+def run_task(args):
+    number = args.task_id + args.task_offset
 
-    pending = [
-        i
-        for i, model in enumerate(MODELS)
-        if not author_test_done(model)
-    ]
+    if number < 0:
+        raise RuntimeError(f"Invalid task ID {number}.")
 
-    if not pending:
+    conf = ensure_prepared(args)
+    items = work_items(load_tasks())
+
+    if number >= len(items):
         log(
-            "[DONE]",
-            "All original author tests encoded."
+            "[NOTHING TO DO]",
+            f"task {number}; this run has "
+            f"{len(items)} work items "
+            f"(array {array_range(load_tasks())})."
         )
         return
 
-    job_id = sbatch(
-        args,
-        "Phylo_S3_AUTHOR",
-        compact(pending) + "%4",
-        [
-            "--author-worker",
-            "$SLURM_ARRAY_TASK_ID",
-        ],
+    kind, item = items[number]
+
+    log(
+        "[TASK]",
+        number,
+        "of",
+        len(items) - 1,
+        "|",
+        kind,
+        item["model"] if kind == "trainval" else item,
+        f"chunk {item['chunk']}" if kind == "trainval" else "",
     )
 
-    json_save(
-        CONTROL / "author_test_jobs.json",
-        {
-            "job": job_id,
-            "models": [
-                MODELS[i] for i in pending
-            ],
-        },
-    )
+    if kind == "trainval":
+        check_sources(conf)
+        worker(item, conf)
 
-    print(
-        "Author test encoding job:",
-        job_id,
-    )
+    else:
+        author_worker(item)
 
 
-# ============================================================
-# 23. OPTIONAL: CANCEL ONLY LEGACY GENERATED TESTS
-# ============================================================
+def run_pilots(args):
+    """One tree per model, run here (no SLURM). Use before sbatch."""
 
-def cancel_old_generated_tests():
-    if (
-        not TASKS.is_file()
-        or not JOBS.is_file()
-    ):
+    ensure_prepared(args)
+
+    failed = []
+
+    for model in MODELS:
+        log("[PILOT]", model)
+
+        try:
+            pilot(model)
+            log("[PILOT PASS]", model)
+
+        except Exception as error:
+            log("[PILOT FAILED]", model, repr(error))
+            failed.append(model)
+
+    if failed:
         raise RuntimeError(
-            "No existing task/job manifests."
+            "Pilot failed for: " + ", ".join(failed)
         )
 
-    check_author_archives()
-
-    test_ids = [
-        task["id"]
-        for task in load_tasks()
-        if task["split"] == "test"
-    ]
-
-    if not test_ids:
-        print(
-            "No generated-test jobs to cancel."
-        )
-        return
-
-    if (
-        not shutil.which("squeue")
-        or not shutil.which("scancel")
-    ):
-        raise RuntimeError(
-            "SLURM cancellation commands unavailable."
-        )
-
-    for job_id in json_read(JOBS).get("jobs", []):
-        result = subprocess.run(
-            [
-                "squeue",
-                "-h",
-                "-j",
-                str(job_id),
-                "-o",
-                "%j",
-            ],
-            capture_output=True,
-            text=True,
-        )
-
-        names = result.stdout.splitlines()
-
-        is_generation = any(
-            "Phylo_S3" in name
-            and "PILOT" not in name
-            for name in names
-        )
-
-        if not is_generation:
-            continue
-
-        for task_id in test_ids:
-            key = f"{job_id}_{task_id}"
-
-            result = subprocess.run(
-                [
-                    "scancel",
-                    key,
-                ],
-                capture_output=True,
-                text=True,
-            )
-
-            if result.returncode == 0:
-                print(
-                    "[CANCELLED]",
-                    key,
-                )
-
+    print()
+    print("All pilots passed. Submit with:")
     print(
-        "Training/validation jobs and saved "
-        "results were not touched."
+        f"  sbatch --array={array_range(load_tasks())}%100 "
+        "Step3-GenerateData.sh"
     )
 
 
 # ============================================================
-# 24. COMMAND-LINE INTERFACE
+# 23. COMMAND-LINE INTERFACE
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=(
-            argparse.ArgumentDefaultsHelpFormatter
+            argparse.RawDescriptionHelpFormatter
         ),
     )
 
@@ -2751,39 +2740,46 @@ def main():
         required=True
     )
 
-    for name in (
-        "submit",
-        "pilot-only",
-        "resume",
-        "status",
-        "audit-author-tests",
-        "encode-author-tests",
-        "cancel-generated-tests",
+    actions.add_argument(
+        "--task-id",
+        type=int,
+        help="Run one work item (SLURM_ARRAY_TASK_ID).",
+    )
+
+    for name, text in (
+        ("prepare", "Prepare the run (parameters, chunks, task list)."),
+        ("pilot", "Simulate and encode one tree per model here."),
+        ("status", "Show verified progress."),
+        ("array-range", "Print the --array range for sbatch."),
+        ("pending-array", "Print unfinished work items for sbatch --array."),
+        ("audit-author-tests", "Check the authors' test archives."),
     ):
         actions.add_argument(
             "--" + name,
             action="store_true",
+            help=text,
         )
 
-    actions.add_argument(
-        "--worker",
+    parser.add_argument(
+        "--task-offset",
         type=int,
-        help=argparse.SUPPRESS,
+        default=int(
+            os.environ.get("TASK_OFFSET", "0")
+        ),
+        help=(
+            "Added to --task-id (env TASK_OFFSET). Needed only "
+            "when a run has more than 1000 work items."
+        ),
     )
 
-    actions.add_argument(
-        "--pilot-worker",
+    parser.add_argument(
+        "--prepare-wait",
         type=int,
-        help=argparse.SUPPRESS,
+        default=180,
+        help="Minutes an array task waits for preparation.",
     )
 
-    actions.add_argument(
-        "--author-worker",
-        type=int,
-        help=argparse.SUPPRESS,
-    )
-
-    # Configurable sizes and parameters.
+    # Configurable sizes and parameters (used only when preparing).
     parser.add_argument(
         "--n-full",
         type=int,
@@ -2830,102 +2826,52 @@ def main():
         default=500,
     )
 
-    # SLURM settings.
-    parser.add_argument(
-        "--partition",
-        default="general",
-    )
-
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=16,
-    )
-
-    parser.add_argument(
-        "--cpus",
-        type=int,
-        default=1,
-    )
-
-    parser.add_argument(
-        "--mem",
-        default="8G",
-    )
-
-    parser.add_argument(
-        "--time",
-        default="12:00:00",
-    )
-
     args = parser.parse_args()
 
-    if args.status:
+    if args.task_id is not None:
+        run_task(args)
+
+    elif args.prepare:
+        manual_prepare(args)
+
+    elif args.pilot:
+        run_pilots(args)
+
+    elif args.status:
         status()
+
+    elif args.array_range:
+        count = expected_item_count(args)
+
+        if count - 1 > MAX_ARRAY_INDEX:
+            print(
+                f"[WARNING] {count} work items exceed the "
+                "1000-index limit; submit in blocks with "
+                "TASK_OFFSET.",
+                file=sys.stderr,
+            )
+
+        print(array_range(args=args))
+
+    elif args.pending_array:
+        if not CONFIG.is_file():
+            raise RuntimeError(
+                "No prepared run. Run --prepare first."
+            )
+
+        pending = pending_items()
+
+        if not pending:
+            print(
+                "[DONE] Every work item is verified.",
+                file=sys.stderr,
+            )
+
+        # stdout carries only the range, for: sbatch --array=$(...)
+        print(compact(pending))
 
     elif args.audit_author_tests:
         audit_author()
-
-    elif args.encode_author_tests:
-        submit_author_tests(args)
-
-    elif args.cancel_generated_tests:
-        cancel_old_generated_tests()
-
-    elif args.worker is not None:
-        conf = json_read(CONFIG)
-
-        task = load_tasks()[args.worker]
-
-        # Skip old generated-test array elements.
-        if task["split"] == "test":
-            log(
-                "[SKIP]",
-                "Redundant generated test task",
-                task["id"],
-            )
-            return
-
-        check_sources(conf)
-
-        worker(task, conf)
-
-    elif args.pilot_worker is not None:
-        if not 0 <= args.pilot_worker < len(MODELS):
-            raise RuntimeError(
-                "Invalid pilot task ID."
-            )
-
-        pilot(MODELS[args.pilot_worker])
-
-    elif args.author_worker is not None:
-        if not 0 <= args.author_worker < len(MODELS):
-            raise RuntimeError(
-                "Invalid author test task ID."
-            )
-
-        author_worker(MODELS[args.author_worker])
-
-    elif args.resume:
-        if not CONFIG.is_file():
-            raise RuntimeError(
-                "No existing run. Use --submit first."
-            )
-
-        conf = json_read(CONFIG)
-
-        check_sources(conf)
-
-        submit(args, conf)
-
-    else:
-        conf = prepare(args)
-
-        submit(
-            args,
-            conf,
-            pilot_only=args.pilot_only,
-        )
 
 
 if __name__ == "__main__":

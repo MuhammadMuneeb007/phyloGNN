@@ -1,8 +1,26 @@
 
 #!/usr/bin/env python3
-"""Install PhyloCNN dependencies in the current working directory."""
+"""
+Step2-InstallPackages.py
+
+Install original PhyloCNN dependencies plus:
+    - TensorFlow / Keras
+    - Spektral
+    - PyTorch
+    - PyTorch Geometric
+
+All Python frameworks share ONE environment:
+    .envs/phylocnn
+
+R dependencies are installed separately:
+    .envs/phylo-r
+
+Designed for Linux HPC and Python 3.8.
+Existing environments are reused.
+"""
 
 from pathlib import Path
+import importlib.util
 import os
 import re
 import shlex
@@ -10,7 +28,6 @@ import shutil
 import subprocess
 import sys
 
-# Everything is relative to where you RUN this script.
 ROOT = Path.cwd().resolve()
 
 ENV_DIR = ROOT / ".envs"
@@ -23,21 +40,42 @@ R_PREFIX = ENV_DIR / "phylo-r"
 SOURCE = ROOT / "phyloCNN" / "environment.yml"
 REQ_FILE = ROOT / "Step2-PhyloCNN-Linux-requirements.txt"
 
+PYTHON_VERSION = "3.8.20"
+
+# Python 3.8-compatible framework versions.
+# Retain original TensorFlow/Keras/NumPy pins.
+EXTRA_PACKAGES = [
+    "spektral==1.3.1",
+    "torch==2.4.1",
+    "torch-geometric==2.6.1",
+]
+
+EXCLUDED_PACKAGES = {
+    "tensorflow-macos",
+    "tensorflow-metal",
+    "appnope",
+}
+
 
 def section(title):
-    print("\n" + "=" * 65, flush=True)
+    print("\n" + "=" * 70, flush=True)
     print(title, flush=True)
-    print("=" * 65, flush=True)
+    print("=" * 70, flush=True)
 
 
 def run(command, env):
     args = [str(x) for x in command]
     print("$ " + shlex.join(args), flush=True)
-    subprocess.run(args, cwd=ROOT, env=env, check=True)
+    subprocess.run(
+        args,
+        cwd=ROOT,
+        env=env,
+        check=True,
+    )
 
 
 def configure_local_storage():
-    """Store caches, temporary files and environments locally."""
+    """Keep environments, caches, and temporary files local."""
 
     directories = [
         ENV_DIR,
@@ -70,11 +108,26 @@ def configure_local_storage():
     return env
 
 
+def package_name(requirement):
+    """Extract normalized package name."""
+
+    name = re.split(
+        r"[=<>!~\[\s]",
+        requirement,
+        maxsplit=1,
+    )[0]
+
+    return name.lower().replace("_", "-")
+
+
 def read_requirements():
-    """Read the ORIGINAL phyloCNN/environment.yml file."""
+    """Read original PhyloCNN requirements and add GNN frameworks."""
 
     if not SOURCE.is_file():
-        sys.exit("ERROR: Missing phyloCNN/environment.yml")
+        sys.exit(
+            "ERROR: Missing original environment file: "
+            + str(SOURCE)
+        )
 
     requirements = []
     inside_pip = False
@@ -88,82 +141,323 @@ def read_requirements():
         if not inside_pip:
             continue
 
-        match = re.match(r"^\s{6,}-\s+(\S.*?)\s*$", line)
+        match = re.match(
+            r"^\s{6,}-\s+(\S.*?)\s*$",
+            line,
+        )
 
         if match:
             requirements.append(match.group(1))
+
         elif line.strip() and not line.lstrip().startswith("#"):
             break
 
     if len(requirements) < 30:
-        sys.exit("ERROR: Could not read PhyloCNN dependencies.")
+        sys.exit(
+            "ERROR: Could not read original PhyloCNN dependencies."
+        )
 
-    excluded = {"tensorflow-macos", "appnope"}
     linux_requirements = []
 
     for requirement in requirements:
-        name = re.split(
-            r"[=<>!~\[]", requirement, maxsplit=1
-        )[0].lower().replace("_", "-")
+        name = package_name(requirement)
 
-        if name not in excluded:
-            linux_requirements.append(requirement)
-        else:
-            print("[SKIP macOS package]", requirement)
+        if name in EXCLUDED_PACKAGES:
+            print("[SKIP macOS]", requirement)
+            continue
 
-    REQ_FILE.write_text("\n".join(linux_requirements) + "\n")
+        linux_requirements.append(requirement)
+
+    # Replace existing specifications for extra frameworks
+    # to avoid duplicate or conflicting direct requirements.
+    extra_names = {
+        package_name(req)
+        for req in EXTRA_PACKAGES
+    }
+
+    linux_requirements = [
+        req for req in linux_requirements
+        if package_name(req) not in extra_names
+    ]
+
+    linux_requirements.extend(EXTRA_PACKAGES)
+
+    REQ_FILE.write_text(
+        "\n".join(linux_requirements) + "\n"
+    )
 
     print("Original packages:", len(requirements))
     print("Linux packages:", len(linux_requirements))
+    print("Additional GNN packages:")
+
+    for package in EXTRA_PACKAGES:
+        print("  +", package)
+
     print("Saved requirements:", REQ_FILE)
 
 
-def create_environment(manager, env, prefix, executable, packages):
-    """Create environment in current working directory."""
+def create_environment(
+    manager,
+    env,
+    prefix,
+    executable,
+    packages,
+):
+    """Create or reuse a local Conda environment."""
 
     if executable.is_file():
-        print("[REUSE] Existing environment:", prefix, flush=True)
+        print(
+            "[REUSE] Existing environment:",
+            prefix,
+            flush=True,
+        )
         return
 
     if prefix.exists():
-        sys.exit("ERROR: Incomplete environment: " + str(prefix))
+        sys.exit(
+            "ERROR: Incomplete environment exists: "
+            + str(prefix)
+        )
 
-    run([
-        manager, "create", "-y",
-        "--prefix", prefix,
+    command = [
+        manager,
+        "create",
+        "-y",
+        "--prefix",
+        prefix,
         "--override-channels",
-        "-c", "conda-forge",
+        "-c",
+        "conda-forge",
         *packages,
-    ], env)
+    ]
+
+    run(command, env)
 
     if not executable.is_file():
-        sys.exit("ERROR: Environment creation failed.")
+        sys.exit(
+            "ERROR: Environment creation failed: "
+            + str(prefix)
+        )
+
+
+def install_python_packages(python, env):
+    """Install all packages into the same PhyloCNN environment."""
+
+    uv = shutil.which("uv")
+
+    if uv:
+        print("[INSTALLER] uv detected")
+
+        command = [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            python,
+            "-r",
+            REQ_FILE,
+        ]
+
+    else:
+        print("[INSTALLER] Using pip")
+
+        command = [
+            python,
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            REQ_FILE,
+        ]
+
+    run(command, env)
+
+
+def verify_python_packages(python, env):
+    """Verify package versions, imports, and basic GNN execution."""
+
+    section("VERIFY PYTHON DEPENDENCIES")
+
+    run([
+        python,
+        "-m",
+        "pip",
+        "check",
+    ], env)
+
+    verification = r'''
+import importlib.metadata as metadata
+
+packages = [
+    "tensorflow",
+    "keras",
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "ete3",
+    "phylodeep",
+    "spektral",
+    "torch",
+    "torch-geometric",
+]
+
+print("\nINSTALLED PACKAGE VERSIONS")
+print("-" * 55)
+
+for package in packages:
+    print(
+        f"{package:20s}",
+        metadata.version(package)
+    )
+
+print("\nVERIFYING TENSORFLOW")
+
+import tensorflow as tf
+
+print("TensorFlow:", tf.__version__)
+
+print("\nVERIFYING SPEKTRAL")
+
+import spektral
+
+from spektral.layers import (
+    GCNConv,
+    GATConv,
+    GINConv,
+    ECCConv,
+    GraphSageConv,
+)
+
+print("Spektral:", spektral.__version__)
+print("Spektral GNN layers imported successfully")
+
+print("\nVERIFYING PYTORCH")
+
+import torch
+
+print("PyTorch:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+
+print("\nVERIFYING PYTORCH GEOMETRIC")
+
+import torch_geometric
+
+from torch_geometric.nn import (
+    GCNConv as PyG_GCNConv,
+    GATConv as PyG_GATConv,
+    GINConv as PyG_GINConv,
+    SAGEConv,
+    GINEConv,
+)
+
+print("PyG:", torch_geometric.__version__)
+
+# Small CPU graph test
+x = torch.randn(4, 8)
+
+edge_index = torch.tensor(
+    [
+        [0, 1, 2, 3],
+        [1, 2, 3, 0],
+    ],
+    dtype=torch.long,
+)
+
+model = PyG_GCNConv(8, 16)
+
+output = model(x, edge_index)
+
+assert output.shape == (4, 16)
+
+print("PyTorch Geometric graph test PASSED")
+
+print("\n" + "=" * 55)
+print("ALL PYTHON FRAMEWORKS VERIFIED")
+print("=" * 55)
+'''
+
+    run([
+        python,
+        "-c",
+        verification,
+    ], env)
+
+
+def install_r_packages(manager, env):
+    """Install R packages needed for BiSSE."""
+
+    section("INSTALL R PACKAGES FOR BISSE")
+
+    rscript = R_PREFIX / "bin" / "Rscript"
+
+    create_environment(
+        manager,
+        env,
+        R_PREFIX,
+        rscript,
+        [
+            "r-base=4.4",
+            "r-castor",
+            "r-treesim",
+        ],
+    )
+
+    run([
+        rscript,
+        "-e",
+        (
+            'library(castor); '
+            'library(TreeSim); '
+            'cat("BiSSE R packages OK\\n")'
+        ),
+    ], env)
 
 
 def main():
 
-    section("STEP 2: INSTALL PHYLOCNN PACKAGES")
+    section("STEP 2: INSTALL PHYLOCNN + SPEKTRAL + PYTORCH GEOMETRIC")
 
     print("CURRENT DIRECTORY:", ROOT)
 
-    # Verify all three repositories.
-    for repo in ("phyloCNN", "phylodeep", "deeptimelearning"):
-        if not (ROOT / repo).is_dir():
-            sys.exit("ERROR: Missing repository: " + repo)
+    if not sys.platform.startswith("linux"):
+        sys.exit(
+            "ERROR: This installer is designed for Linux HPC."
+        )
+
+    # Verify repositories.
+    for repo in (
+        "phyloCNN",
+        "phylodeep",
+        "deeptimelearning",
+    ):
+        path = ROOT / repo
+
+        if not path.is_dir():
+            sys.exit(
+                "ERROR: Missing repository: "
+                + str(path)
+            )
 
         print("[FOUND]", repo)
 
-    if not sys.platform.startswith("linux"):
-        sys.exit("ERROR: This installer is for Linux HPC.")
-
     manager = next(
-        (shutil.which(x) for x in ("mamba", "micromamba", "conda")
-         if shutil.which(x)),
-        None
+        (
+            shutil.which(name)
+            for name in (
+                "mamba",
+                "micromamba",
+                "conda",
+            )
+            if shutil.which(name)
+        ),
+        None,
     )
 
     if not manager:
-        sys.exit("ERROR: Mamba or Conda not available.")
+        sys.exit(
+            "ERROR: Mamba, Micromamba, or Conda is required."
+        )
 
     env = configure_local_storage()
 
@@ -171,62 +465,32 @@ def main():
 
     read_requirements()
 
-    section("2/5 - CREATE LOCAL PYTHON ENVIRONMENT")
+    section("2/5 - CREATE OR REUSE PYTHON ENVIRONMENT")
 
     python = PY_PREFIX / "bin" / "python"
 
     create_environment(
-        manager, env, PY_PREFIX, python,
-        ["python=3.8.20", "pip=24.2"]
+        manager,
+        env,
+        PY_PREFIX,
+        python,
+        [
+            f"python={PYTHON_VERSION}",
+            "pip=24.2",
+        ],
     )
 
-    section("3/5 - INSTALL ALL PYTHON PACKAGES")
+    section("3/5 - INSTALL ALL PYTHON FRAMEWORKS")
 
-    uv = shutil.which("uv")
+    install_python_packages(python, env)
 
-    if uv:
-        run([
-            uv, "pip", "install",
-            "--python", python,
-            "-r", REQ_FILE
-        ], env)
-    else:
-        run([
-            python, "-m", "pip", "install",
-            "-r", REQ_FILE
-        ], env)
+    section("4/5 - VERIFY ALL PYTHON FRAMEWORKS")
 
-    section("4/5 - VERIFY PYTHON PACKAGES")
+    verify_python_packages(python, env)
 
-    run([python, "-m", "pip", "check"], env)
+    section("5/5 - INSTALL R PACKAGES")
 
-    check = (
-    "import importlib.metadata as m; "
-    "names=['tensorflow','keras','numpy','pandas',"
-    "'scipy','scikit-learn','ete3','phylodeep','spektral']; "
-    "[(print(n,m.version(n))) for n in names]; "
-    "import spektral; "
-    "from spektral.layers import "
-    "GCNConv, GATConv, GINConv, ECCConv, GraphSageConv; "
-    "print('Spektral GNN layers OK')"
-    )
-
-    run([python, "-c", check], env)
-
-    section("5/5 - INSTALL R PACKAGES FOR BISSE")
-
-    rscript = R_PREFIX / "bin" / "Rscript"
-
-    create_environment(
-        manager, env, R_PREFIX, rscript,
-        ["r-base=4.4", "r-castor", "r-treesim"]
-    )
-
-    run([
-        rscript, "-e",
-        'library(castor); library(TreeSim); '
-        'cat("BiSSE R packages OK\\n")'
-    ], env)
+    install_r_packages(manager, env)
 
     section("STEP 2 COMPLETED SUCCESSFULLY")
 
@@ -236,11 +500,25 @@ def main():
     print("Package caches:", CACHE_DIR)
     print("Temporary files:", TMP_DIR)
 
+    print("\nInstalled frameworks:")
+    print("  TensorFlow / Keras")
+    print("  Spektral")
+    print("  PyTorch")
+    print("  PyTorch Geometric")
+
+    print("\nTo use the environment:")
+    print(f"  conda activate {PY_PREFIX}")
+
+    print("\nOr execute Python directly:")
+    print(f"  {PY_PREFIX}/bin/python")
+
 
 if __name__ == "__main__":
     try:
         main()
+
     except subprocess.CalledProcessError as error:
         sys.exit(
-            f"INSTALLATION FAILED (exit code {error.returncode})"
+            "INSTALLATION FAILED "
+            f"(exit code {error.returncode})"
         )
