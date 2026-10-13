@@ -41,6 +41,7 @@ forward/backward pass on a toy batch.
 
 from __future__ import annotations
 
+import inspect
 from typing import Optional, Sequence
 
 import torch
@@ -60,6 +61,14 @@ from torch_geometric.nn import (
     global_max_pool,
     global_mean_pool,
 )
+
+
+# Interface version checked by Step4-CheckPhyloCNN.py (catches mismatched copies of the files).
+API_VERSION = 4   # 3 = pooling mean_max / mean_max_root; 4 = mean_max_sum, attention pooling, jk='cat'
+
+# GPSConv gained `attn_type` in newer PyTorch Geometric releases; older ones always use
+# multi-head attention, which is what this module asks for anyway.
+_GPS_HAS_ATTN_TYPE = "attn_type" in inspect.signature(GPSConv.__init__).parameters
 
 
 # =============================================================================
@@ -89,6 +98,24 @@ ALIASES = {
 }
 
 POOLINGS = {"mean": global_mean_pool, "sum": global_add_pool, "max": global_max_pool}
+# Combined readouts (concatenated): mean + max, and mean + max + the root node's embedding.
+# The root is the FIRST node of every graph (Graph_Encoding.tree_to_graph adds it first).
+POOLING_PARTS = {"mean": ("mean",), "sum": ("sum",), "max": ("max",), "mean_max": ("mean", "max"),
+                 "mean_max_root": ("mean", "max", "root"), "mean_max_sum": ("mean", "max", "sum"),
+                 "attention": ("attention",)}
+# jk ("jumping knowledge"): "cat" pools the concatenation of every layer's node embeddings
+# (local and wider neighbourhoods together) instead of the last layer only.
+JK_MODES = ("none", "cat")
+
+
+def _attention_pool(dim):
+    """Attention readout: softmax(gate(h)) weighted sum of the node embeddings of each graph."""
+    try:
+        from torch_geometric.nn.aggr import AttentionalAggregation
+        return AttentionalAggregation(gate_nn=nn.Linear(dim, 1)), "aggr"
+    except ImportError:  # older PyTorch Geometric
+        from torch_geometric.nn import GlobalAttention
+        return GlobalAttention(gate_nn=nn.Linear(dim, 1)), "global"
 SAGE_AGGREGATIONS = ("mean", "max", "sum")
 HEAD_UNITS = (64, 32, 16, 8)
 
@@ -169,25 +196,35 @@ class MessagePassingTower(nn.Module):
     def __init__(self, kind: str, input_dim: int, hidden_dim: int = 32, num_layers: int = 3,
                  dropout: float = 0.1, pooling: str = "mean", norm: str = "batch", residual: bool = False,
                  heads: int = 4, sage_aggregation: str = "mean", gin_mlp_hidden=None, edge_dim=None,
-                 degree_histogram=None):
+                 degree_histogram=None, jk: str = "none"):
         super().__init__()
         if num_layers < 1:
             raise ValueError("num_layers must be >= 1")
-        if pooling not in POOLINGS:
-            raise ValueError(f"pooling must be one of {sorted(POOLINGS)}")
+        if jk not in JK_MODES:
+            raise ValueError(f"jk must be one of {JK_MODES}")
+        self.jk = jk
+        if pooling not in POOLING_PARTS:
+            raise ValueError(f"pooling must be one of {sorted(POOLING_PARTS)}")
         self.kind = kind
         self.uses_edges = kind in USES_EDGE_FEATURES
         self.residual = bool(residual)
         self.dropout = float(dropout)
-        self.pool = POOLINGS[pooling]
+        self.pool_parts = POOLING_PARTS[pooling]
+        node_dim = hidden_dim * (num_layers if jk == "cat" else 1)
+        self.out_dim = node_dim * len(self.pool_parts)
+        if "attention" in self.pool_parts:
+            self.attention, self._attention_api = _attention_pool(node_dim)
 
         if kind == "gps":
             # GPSConv keeps the width fixed and has its own norms, residuals and MLP.
             self.encoder = nn.Linear(input_dim, hidden_dim)
+            gps_options = {"heads": heads, "dropout": dropout}
+            if _GPS_HAS_ATTN_TYPE:
+                gps_options["attn_type"] = "multihead"
             self.convs = nn.ModuleList(
                 GPSConv(hidden_dim,
                         GINEConv(_mlp(hidden_dim, [hidden_dim], hidden_dim), train_eps=True, edge_dim=edge_dim),
-                        heads=heads, dropout=dropout, attn_type="multihead")
+                        **gps_options)
                 for _ in range(num_layers)
             )
             self.norms = None
@@ -206,11 +243,14 @@ class MessagePassingTower(nn.Module):
     def forward(self, x, edge_index, edge_attr, batch, num_graphs):
         if self.kind == "gps":
             h = self.encoder(x)
+            layers = []
             for conv in self.convs:
                 h = conv(h, edge_index, batch, edge_attr=edge_attr)
-            return self.pool(h, batch, num_graphs)
+                layers.append(h)
+            return self.pool(torch.cat(layers, dim=-1) if self.jk == "cat" else h, batch, num_graphs)
 
         h = x
+        layers = []
         last = len(self.convs) - 1
         for i, (conv, norm) in enumerate(zip(self.convs, self.norms)):
             z = conv(h, edge_index, edge_attr) if self.uses_edges else conv(h, edge_index)
@@ -220,7 +260,24 @@ class MessagePassingTower(nn.Module):
             if i < last:
                 z = F.dropout(z, p=self.dropout, training=self.training)
             h = z
-        return self.pool(h, batch, num_graphs)
+            layers.append(h)
+        return self.pool(torch.cat(layers, dim=-1) if self.jk == "cat" else h, batch, num_graphs)
+
+    def pool(self, h, batch, num_graphs):
+        parts = []
+        for part in self.pool_parts:
+            if part == "root":
+                counts = torch.bincount(batch, minlength=num_graphs)
+                first = torch.cumsum(counts, 0) - counts          # index of each graph's first node
+                parts.append(h[first])
+            elif part == "attention":
+                if self._attention_api == "aggr":
+                    parts.append(self.attention(h, batch, dim_size=num_graphs))
+                else:
+                    parts.append(self.attention(h, batch, size=num_graphs))
+            else:
+                parts.append(POOLINGS[part](h, batch, num_graphs))
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
 
 
 class DenseHead(nn.Module):
@@ -279,8 +336,7 @@ class PhyloGNN(_GraphModel):
         super().__init__(output_dim, num_graph_features, output_activation)
         self.kind = kind
         self.tower = MessagePassingTower(kind, input_dim, **tower_kwargs)
-        hidden = tower_kwargs.get("hidden_dim", 32)
-        self.head = DenseHead(hidden + self.num_graph_features, output_dim, head_units)
+        self.head = DenseHead(self.tower.out_dim + self.num_graph_features, output_dim, head_units)
 
     def forward(self, data):
         x, edge_index, edge_attr, batch, b = self._unpack(data)
@@ -297,10 +353,9 @@ class _PerBranchFusion(_GraphModel):
     def __init__(self, input_dim, output_dim, num_graph_features=0, head_units=HEAD_UNITS,
                  output_activation=None, **tower_kwargs):
         super().__init__(output_dim, num_graph_features, output_activation)
-        hidden = tower_kwargs.get("hidden_dim", 32)
         self.towers = nn.ModuleList(MessagePassingTower(b, input_dim, **tower_kwargs) for b in self.BRANCHES)
-        self.heads = nn.ModuleList(DenseHead(hidden + self.num_graph_features, output_dim, head_units)
-                                   for _ in self.BRANCHES)
+        self.heads = nn.ModuleList(DenseHead(t.out_dim + self.num_graph_features, output_dim, head_units)
+                                   for t in self.towers)
         self.fusion_logits = nn.Parameter(torch.zeros(int(output_dim), len(self.BRANCHES)))
 
     def forward(self, data):
@@ -333,10 +388,9 @@ class GNNFusion(_GraphModel):
     def __init__(self, input_dim, output_dim, num_graph_features=0, head_units=HEAD_UNITS,
                  output_activation=None, **tower_kwargs):
         super().__init__(output_dim, num_graph_features, output_activation)
-        hidden = tower_kwargs.get("hidden_dim", 32)
         self.towers = nn.ModuleList(MessagePassingTower(b, input_dim, **tower_kwargs) for b in self.BRANCHES)
         self.fusion_logits = nn.Parameter(torch.zeros(len(self.BRANCHES)))
-        self.head = DenseHead(hidden + self.num_graph_features, output_dim, head_units)
+        self.head = DenseHead(self.towers[0].out_dim + self.num_graph_features, output_dim, head_units)
 
     def forward(self, data):
         x, edge_index, edge_attr, batch, b = self._unpack(data)
@@ -372,6 +426,7 @@ def build_graph_model(
     degree_histogram=None,
     head_units=HEAD_UNITS,
     output_activation: Optional[str] = "linear",
+    jk: str = "none",
     **_ignored,
 ) -> nn.Module:
     """Build one graph architecture as a torch.nn.Module.
@@ -386,7 +441,8 @@ def build_graph_model(
     architecture = canonical_architecture(architecture)
     tower_kwargs = dict(hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, pooling=pooling,
                         norm=norm, residual=residual, heads=heads, sage_aggregation=sage_aggregation,
-                        gin_mlp_hidden=gin_mlp_hidden, edge_dim=edge_dim, degree_histogram=degree_histogram)
+                        gin_mlp_hidden=gin_mlp_hidden, edge_dim=edge_dim, degree_histogram=degree_histogram,
+                        jk=jk)
     common = dict(input_dim=int(input_dim), output_dim=int(output_dim),
                   num_graph_features=int(num_graph_features), head_units=head_units,
                   output_activation=output_activation)
@@ -445,18 +501,22 @@ def self_check():
 
     print(f"torch {torch.__version__} | torch_geometric {torch_geometric.__version__}")
     batch = _toy_batch()
-    for name in OUR_ARCHITECTURES:
-        torch.manual_seed(42)
-        model = build_graph_model(name, input_dim=7, output_dim=2, num_graph_features=1, edge_dim=2)
-        model.train()
-        out = model(batch)
-        out.square().mean().backward()
-        no_grad = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
-        ok = out.shape == (2, 2) and torch.isfinite(out).all() and not no_grad
-        print(f"  {'PASS' if ok else 'FAIL'}  {name:22s} params={count_params(model)['trainable']:7,d}  "
-              f"output={tuple(out.shape)}" + (f"  no gradient: {no_grad[:3]}" if no_grad else ""))
-        if not ok:
-            raise SystemExit(1)
+    configs = (dict(), dict(pooling="mean_max_root", num_layers=6, residual=True),
+               dict(pooling="mean_max_sum", jk="cat"), dict(pooling="attention"))
+    for config in configs:
+        print(f"  settings: {config or 'defaults (mean pooling, 3 layers)'}")
+        for name in OUR_ARCHITECTURES:
+            torch.manual_seed(42)
+            model = build_graph_model(name, input_dim=7, output_dim=2, num_graph_features=1, edge_dim=2, **config)
+            model.train()
+            out = model(batch)
+            out.square().mean().backward()
+            no_grad = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+            ok = out.shape == (2, 2) and torch.isfinite(out).all() and not no_grad
+            print(f"  {'PASS' if ok else 'FAIL'}  {name:22s} params={count_params(model)['trainable']:7,d}  "
+                  f"output={tuple(out.shape)}" + (f"  no gradient: {no_grad[:3]}" if no_grad else ""))
+            if not ok:
+                raise SystemExit(1)
     print(f"All {len(OUR_ARCHITECTURES)} architectures build, run and train.")
 
 

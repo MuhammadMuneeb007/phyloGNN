@@ -25,3 +25,6 @@ __pycache__/
 *.tar.gz
 .env
 .env.*
+EmpiricalValidation/
+ExactComparison/
+logs/

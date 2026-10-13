@@ -1,0 +1,1166 @@
+#!/usr/bin/env python3
+"""
+Step4_Experiment2_FullDataset.py
+
+EXPERIMENT 2 — FULL SIMULATED TRAINING DATA, AUTHORS' TEST SET UNTOUCHED
+
+Same 11 models and the same training settings as Step 3. Only the data changes:
+
+  Step 3:  BD-shipped  -> the authors' shipped trees, split 56/24/20
+  Step 4:  BD          -> Step 1 simulations, split 70/30 train/validation;
+                          the authors' Test_Sets are used ONLY for the final test
+
+The PhyloGNN repository already defines this protocol. Its built-in datasets
+BD / BDEI / BDSS / BiSSE read the training simulations from
+
+    PhyloGNN/Training_Data/<NAME>/parameters_<NAME>.txt
+    PhyloGNN/Training_Data/<NAME>/<NAME>_trees.nwk
+
+and use PhyloGNN/Test_Sets/<NAME>/ as the held-out test set. Targets, target
+scaling, the sampling-probability covariate, losses and the BiSSE tip-state
+encoding therefore come from the repository, exactly as in Step 3. The test
+trees are never part of the training/validation pool; every model is scored on
+them once, after early stopping on the validation set.
+
+Training code is reused from Step3_Experiment1_LimitedTest.py (model factory,
+author PhyloCNN JSON loader, Spektral patch, metrics). Hyperparameters are read
+from Step 3, so the two experiments cannot drift apart.
+
+Commands (run inside PhyloGNN_FINAL, with the GNN Python environment):
+  python Step4_Experiment2_FullDataset.py --plan
+  python Step4_Experiment2_FullDataset.py --assemble          # join Step 1 chunks into Training_Data/
+  python Step4_Experiment2_FullDataset.py --preflight
+  python Step4_Experiment2_FullDataset.py --submit --ids 0,3  # optional smoke test: 1 PhyloCNN + 1 GCN
+  python Step4_Experiment2_FullDataset.py --submit            # every incomplete task
+  python Step4_Experiment2_FullDataset.py --status
+  python Step4_Experiment2_FullDataset.py --watch
+  python Step4_Experiment2_FullDataset.py --aggregate
+  python Step4_Experiment2_FullDataset.py --cancel
+
+--submit only submits tasks without a validated result, never duplicates active
+tasks, and never deletes finished results. Use --dry-run to print the sbatch
+commands without submitting.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import traceback
+from collections import Counter
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from itertools import zip_longest
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+
+# =============================================================================
+# REUSE STEP 3
+# =============================================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+STEP3_PATH = SCRIPT_DIR / "Step3_Experiment1_LimitedTest.py"
+
+
+def _load_step3():
+    if not STEP3_PATH.is_file():
+        raise SystemExit(f"[ERROR] Step 4 reuses Step 3; missing {STEP3_PATH}")
+    spec = importlib.util.spec_from_file_location("Step3_Experiment1_LimitedTest", STEP3_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+e1 = _load_step3()
+
+
+# =============================================================================
+# EXPERIMENT SETTINGS
+# =============================================================================
+
+# Built-in full-data datasets of the PhyloGNN repository (no "-shipped").
+DATASETS = ("BD", "BDEI", "BDSS", "BiSSE")
+
+STATE = SCRIPT_DIR / ".step4_experiment2_full"
+LOGS = STATE / "logs"
+RESULTS = SCRIPT_DIR / "results" / "Experiment2_FullData"
+JOB_NAME = "PhyloGNN_E2full"
+CACHE_JOB_NAME = "PhyloGNN_E2full_cache"
+
+REPO = e1.REPO
+TRAINING_DATA = REPO / "Training_Data"
+DEFAULT_STEP1_CHUNKS = SCRIPT_DIR / ".step1_generate_data" / "chunks"
+
+# Step 3's helpers read these module globals at call time.
+e1.DATASETS = DATASETS
+e1.STATE = STATE
+e1.LOGS = LOGS
+e1.TASK_MAP = STATE / "task_map.tsv"
+e1.RESULTS = RESULTS
+e1.JOB_NAME = JOB_NAME
+# Slurm commands built by Step 3 helpers must call THIS script.
+e1.__file__ = str(Path(__file__).resolve())
+
+# Set by the old Step 4 (v6/v7) backend edits; must never be active here.
+OLD_E2_ENV = ("PHYLOGNN_E2_ALLOW_EMPTY_TEST", "PHYLOGNN_E2_CHECKPOINT_DIR")
+OLD_E2_GUARDS = ("E2_SKIP_EMPTY_INTERNAL_TEST_V6", "E2_SAVE_BEST_GNN_WEIGHTS_V6")
+
+NA_TREES = {"", "NA", "NAN", "NONE", "NULL"}
+
+# Newick strings of 500-tip trees can exceed csv's default 128 kB field limit.
+csv.field_size_limit(2**31 - 1)
+
+
+def say(*parts):
+    print(*parts, flush=True)
+
+
+def banner(text):
+    say("=" * 110)
+    say(text)
+    say("=" * 110)
+
+
+def now():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for block in iter(lambda: f.read(4 * 1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def save_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(obj, indent=2, default=str) + "\n")
+    os.replace(tmp, path)
+
+
+def compact_ids(ids) -> str:
+    return e1.compact_ids(ids)
+
+
+def parse_ids(text: str) -> List[int]:
+    n = len(e1.all_tasks())
+    if not text:
+        return list(range(n))
+    chosen = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = (int(x) for x in part.split("-", 1))
+            if b < a:
+                raise SystemExit(f"[ERROR] invalid --ids range {part!r}")
+            chosen.update(range(a, b + 1))
+        else:
+            chosen.add(int(part))
+    bad = sorted(i for i in chosen if not 0 <= i < n)
+    if bad:
+        raise SystemExit(f"[ERROR] task ids must be 0..{n - 1}; got {bad}")
+    return sorted(chosen)
+
+
+# =============================================================================
+# REPOSITORY DATASET DEFINITIONS
+# =============================================================================
+
+def repo_spec(dataset: str):
+    """The repository's own definition of a built-in dataset."""
+    e1.activate_repo_source()
+    from phylognn.data.registry import get_spec
+
+    return get_spec(dataset)
+
+
+def resolve_column(spec, columns, name: str) -> str:
+    """Same alias rule as phylognn.data.dataset._column."""
+    for candidate in spec.column_aliases.get(name, [name]):
+        if candidate in columns:
+            return candidate
+    raise ValueError(
+        f"{spec.name}: column {name!r} (aliases {spec.column_aliases.get(name, [name])}) "
+        f"not found in Step 1 parameters; available: {list(columns)}"
+    )
+
+
+def data_dir(dataset: str) -> Path:
+    return TRAINING_DATA / dataset
+
+
+def params_path(dataset: str) -> Path:
+    return data_dir(dataset) / f"parameters_{dataset}.txt"
+
+
+def trees_path(dataset: str) -> Path:
+    return data_dir(dataset) / f"{dataset}_trees.nwk"
+
+
+def manifest_path(dataset: str) -> Path:
+    return data_dir(dataset) / "ASSEMBLY.json"
+
+
+def read_manifest(dataset: str) -> Optional[Dict]:
+    path = manifest_path(dataset)
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text())
+
+
+# =============================================================================
+# ASSEMBLE STEP 1 OUTPUT INTO Training_Data/<NAME>/
+# =============================================================================
+
+def simulation_id(value, where: str) -> int:
+    """Step 1 writes the same id as 0.0 (trees.tsv) and 0.000000 (parameters)."""
+    try:
+        ident = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{where}: invalid simulation id {value!r}") from exc
+    if not ident.is_finite() or ident != ident.to_integral_value():
+        raise ValueError(f"{where}: simulation id must be an integer, got {value!r}")
+    return int(ident)
+
+
+def step1_chunks(chunk_root: Path, dataset: str) -> List[Dict]:
+    """Every Step 1 chunk of one dataset; all must be verified by Step 1."""
+    base = chunk_root / dataset
+    param_chunks = sorted(base.glob("params_*.tsv"))
+    if not param_chunks:
+        raise SystemExit(f"[ERROR] {dataset}: no Step 1 parameter chunks in {base}")
+
+    chunks, problems = [], []
+    for position, param_chunk in enumerate(param_chunks):
+        index = int(param_chunk.stem.split("_")[1])
+        if index != position:
+            problems.append(f"chunk numbering gap before {param_chunk.name}")
+            continue
+        out = base / f"out_{index:05d}"
+        done = out / "DONE.json"
+        trees = out / ("trees.nwk" if dataset == "BiSSE" else "trees.tsv")
+        values = out / "params_final.txt" if dataset == "BiSSE" else param_chunk
+        if not done.is_file():
+            problems.append(f"chunk {index:05d}: not verified by Step 1 (no {done.name})")
+            continue
+        meta = json.loads(done.read_text())
+        if meta.get("model") != dataset or meta.get("chunk") != index:
+            problems.append(f"chunk {index:05d}: DONE.json belongs to {meta.get('model')}/{meta.get('chunk')}")
+            continue
+        for f in (trees, values):
+            if not f.is_file() or f.stat().st_size == 0:
+                problems.append(f"chunk {index:05d}: missing/empty {f}")
+        chunks.append({
+            "chunk": index,
+            "trees": trees,
+            "parameters": values,
+            "verified_rows": int(meta.get("verified_rows", -1)),
+            "done_sha256": sha256(done),
+        })
+
+    if problems:
+        say(f"[ERROR] {dataset}: Step 1 output is incomplete:")
+        for p in problems[:20]:
+            say("   ", p)
+        if len(problems) > 20:
+            say(f"    ... and {len(problems) - 20} more")
+        raise SystemExit("Finish Step 1 first: python Step1-GenerateData.py --status / --resume")
+    return chunks
+
+
+def source_fingerprint(chunks: List[Dict]) -> List:
+    out = []
+    for c in chunks:
+        row = [c["chunk"], c["done_sha256"]]
+        for key in ("trees", "parameters"):
+            st = Path(c[key]).stat()
+            row += [str(c[key]), st.st_size, st.st_mtime_ns]
+        out.append(row)
+    return out
+
+
+def _split_values(line: str) -> List[str]:
+    line = line.rstrip("\r\n")
+    if "\t" in line:
+        parts = line.split("\t")
+    elif "," in line:
+        parts = line.split(",")
+    else:
+        parts = line.split()
+    return [p.strip().strip('"') for p in parts]
+
+
+def phylodyn_records(chunk: Dict, dataset: str):
+    """BD/BDEI/BDSS: (index,tree) table aligned row-by-row with the parameter chunk."""
+    where = f"{dataset} chunk {chunk['chunk']:05d}"
+    with open(chunk["parameters"], newline="") as ph, open(chunk["trees"], newline="") as th:
+        params = csv.reader(ph, delimiter="\t")
+        header = [h.strip() for h in next(params)]
+        trees = csv.reader(th, delimiter="\t")
+        tree_header = [h.strip() for h in next(trees)]
+        if "index" not in header:
+            raise ValueError(f"{where}: parameter chunk has no 'index' column: {header}")
+        if "index" not in tree_header or "tree" not in tree_header:
+            raise ValueError(f"{where}: expected simulator columns index/tree, got {tree_header}")
+        p_id, t_id, t_tree = header.index("index"), tree_header.index("index"), tree_header.index("tree")
+        for row, (p, t) in enumerate(zip_longest(params, trees)):
+            if p is None or t is None:
+                raise ValueError(f"{where}: tree and parameter row counts differ at row {row}")
+            if len(p) != len(header):
+                raise ValueError(f"{where}: malformed parameter row {row}")
+            param_id = simulation_id(p[p_id], f"{where} row {row}")
+            tree_id = simulation_id(t[t_id], f"{where} row {row}")
+            if param_id != tree_id:
+                raise ValueError(f"{where}: tree id {tree_id} != parameter id {param_id} at row {row}; "
+                                 "files are misaligned")
+            yield header, p, t[t_tree] if len(t) > t_tree else "", param_id
+
+
+def bisse_records(chunk: Dict, spec):
+    """BiSSE: one tree per line + the simulator's state-aligned params_final.txt (no header)."""
+    where = f"BiSSE chunk {chunk['chunk']:05d}"
+    names = list(spec.column_names)
+    header = ["index"] + names
+    with open(chunk["trees"]) as th, open(chunk["parameters"]) as ph:
+        for row, (tree, line) in enumerate(zip_longest(th, ph)):
+            if tree is None or line is None:
+                raise ValueError(f"{where}: tree and parameter line counts differ at row {row}")
+            values = _split_values(line)
+            if len(values) == len(names) + 1:
+                index = values[0]
+                values = values[1:]
+            elif len(values) == len(names):
+                index = str(chunk["chunk"] * 1000 + row)
+            else:
+                raise ValueError(f"{where}: expected {len(names)} or {len(names) + 1} parameter values, "
+                                 f"got {len(values)} at row {row}")
+            yield header, [index] + values, tree, index
+
+
+def check_record(tree: str, record: Dict[str, str], numeric: Dict[str, str], size_column: str, count_leaves):
+    """Return (clean_tree, None) or (None, reason). Same tip rule as the repository."""
+    t = (tree or "").strip()
+    if t.upper() in NA_TREES or t.upper().rstrip(";") in NA_TREES:
+        return None, "empty/NA tree"
+    if not t.endswith(";") and ";" not in t:
+        t += ";"
+    if not t.startswith("(") or t.count(";") != 1 or not t.endswith(";"):
+        return None, "not a single Newick tree"
+    if t.count("(") != t.count(")"):
+        return None, "unbalanced parentheses"
+    for label, column in numeric.items():
+        try:
+            value = float(record[column])
+        except (TypeError, ValueError, KeyError):
+            return None, f"non-numeric {label}"
+        if not math.isfinite(value):
+            return None, f"non-finite {label}"
+    try:
+        size = int(float(record[size_column]))
+    except (TypeError, ValueError, KeyError, OverflowError):
+        return None, f"non-numeric {size_column}"
+    if count_leaves(t) != size:
+        return None, f"tip count != {size_column}"
+    return t, None
+
+
+def assemble_dataset(dataset: str, chunk_root: Path, reassemble: bool) -> None:
+    from phylognn.graph.builder import count_leaves
+
+    spec = repo_spec(dataset)
+    chunks = step1_chunks(chunk_root, dataset)
+    fingerprint = source_fingerprint(chunks)
+    out_dir = data_dir(dataset)
+    outputs = (params_path(dataset), trees_path(dataset))
+    old = read_manifest(dataset)
+
+    if old is not None and all(p.is_file() for p in outputs):
+        unchanged = (old.get("source_fingerprint") == json.loads(json.dumps(fingerprint))
+                     and old.get("parameters_sha256") == sha256(outputs[0])
+                     and old.get("trees_sha256") == sha256(outputs[1]))
+        if unchanged:
+            say(f"[SKIP] {dataset}: already assembled ({old['kept']:,} trees, "
+                f"{old['excluded']:,} excluded) — Step 1 sources unchanged")
+            return
+    if any(p.exists() for p in outputs) or old is not None:
+        if not reassemble:
+            raise SystemExit(
+                f"[ERROR] {dataset}: {out_dir} already holds training data that does not match the current "
+                "Step 1 output. Re-run with --assemble --reassemble to archive it and rebuild. Results "
+                "trained on the old data will then be treated as incomplete."
+            )
+        archive = out_dir / f"archive_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        archive.mkdir(parents=True)
+        for p in (*outputs, manifest_path(dataset), out_dir / "excluded_records.tsv",
+                  out_dir / "source_records.tsv"):
+            if p.exists():
+                shutil.move(str(p), str(archive / p.name))
+        say(f"[ARCHIVED] previous {dataset} training data -> {archive}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp = {p: p.with_name(p.name + ".part") for p in
+           (*outputs, out_dir / "excluded_records.tsv", out_dir / "source_records.tsv")}
+    say(f"[ASSEMBLE] {dataset}: {len(chunks)} verified Step 1 chunks from {chunk_root / dataset}")
+
+    reasons = Counter()
+    raw = kept = 0
+    columns = numeric = size_column = None
+    try:
+        with open(tmp[outputs[0]], "w", newline="") as pf, open(tmp[outputs[1]], "w") as tf, \
+                open(tmp[out_dir / "excluded_records.tsv"], "w", newline="") as xf, \
+                open(tmp[out_dir / "source_records.tsv"], "w", newline="") as sf:
+            pw = csv.writer(pf, delimiter="\t", lineterminator="\n")
+            xw = csv.writer(xf, delimiter="\t", lineterminator="\n")
+            sw = csv.writer(sf, delimiter="\t", lineterminator="\n")
+            xw.writerow(["chunk", "row_in_chunk", "simulation_id", "reason", "tree_preview"])
+            sw.writerow(["training_row", "chunk", "row_in_chunk", "simulation_id"])
+            for c in chunks:
+                records = bisse_records(c, spec) if dataset == "BiSSE" else phylodyn_records(c, dataset)
+                rows_in_chunk = 0
+                for row, (header, values, tree, sim_id) in enumerate(records):
+                    if columns is None:
+                        columns = header
+                        size_column = resolve_column(spec, header, spec.tree_size_column)
+                        wanted = list(spec.target_columns) + list(spec.graph_features)
+                        numeric = {name: resolve_column(spec, header, name) for name in wanted}
+                        pw.writerow(columns)
+                        say(f"  targets/covariates: " +
+                            ", ".join(f"{k}<-{v}" for k, v in numeric.items()) + f"; tree size <- {size_column}")
+                    elif header != columns:
+                        raise ValueError(f"{dataset} chunk {c['chunk']:05d}: parameter columns changed")
+                    raw += 1
+                    rows_in_chunk += 1
+                    clean, reason = check_record(tree, dict(zip(header, values)), numeric, size_column,
+                                                 count_leaves)
+                    if reason:
+                        reasons[reason] += 1
+                        xw.writerow([c["chunk"], row, sim_id, reason, str(tree).strip()[:80]])
+                        continue
+                    pw.writerow(values)
+                    tf.write(clean + "\n")
+                    sw.writerow([kept, c["chunk"], row, sim_id])
+                    kept += 1
+                if rows_in_chunk != c["verified_rows"]:
+                    raise ValueError(f"{dataset} chunk {c['chunk']:05d}: {rows_in_chunk} rows, "
+                                     f"Step 1 verified {c['verified_rows']}")
+
+        if kept == 0:
+            raise ValueError(f"{dataset}: no usable trees")
+        # The repository refuses a dataset when >1% of tip counts disagree (misaligned files).
+        mismatch = reasons.get(f"tip count != {size_column}", 0)
+        if mismatch > 0.01 * raw:
+            raise ValueError(f"{dataset}: {mismatch:,} of {raw:,} trees disagree with {size_column}; "
+                             "trees and parameters look misaligned")
+        for final, part in tmp.items():
+            os.replace(part, final)
+    except BaseException:
+        for t in tmp.values():
+            t.unlink(missing_ok=True)
+        raise
+
+    manifest = {
+        "dataset": dataset,
+        "created": now(),
+        "step1_chunk_root": str(chunk_root / dataset),
+        "chunks": len(chunks),
+        "raw": raw,
+        "kept": kept,
+        "excluded": raw - kept,
+        "excluded_by_reason": dict(reasons),
+        "columns": columns,
+        "target_columns": numeric,
+        "parameters_file": str(outputs[0]),
+        "trees_file": str(outputs[1]),
+        "parameters_sha256": sha256(outputs[0]),
+        "trees_sha256": sha256(outputs[1]),
+        "source_fingerprint": fingerprint,
+        "note": "Step 1 simulations only. The authors' Test_Sets are never written here.",
+    }
+    save_json(manifest_path(dataset), manifest)
+    say(f"[ASSEMBLED] {dataset}: {raw:,} simulated -> {kept:,} usable, {raw - kept:,} excluded")
+    for reason, n in reasons.most_common():
+        say(f"    excluded {n:6,}  {reason}")
+
+
+def assemble(args) -> None:
+    e1.ensure_project_layout()
+    e1.apply_runtime_environment()
+    e1.activate_repo_source()
+    chunk_root = Path(args.step1_chunks).resolve()
+    banner("STEP 4 — ASSEMBLE STEP 1 SIMULATIONS INTO PhyloGNN/Training_Data")
+    say("Source :", chunk_root)
+    say("Target :", TRAINING_DATA)
+    for dataset in DATASETS:
+        assemble_dataset(dataset, chunk_root, args.reassemble)
+    say()
+    say("[READY] Next: python Step4_Experiment2_FullDataset.py --preflight")
+
+
+# =============================================================================
+# PREFLIGHT
+# =============================================================================
+
+def old_backend_edits() -> List[str]:
+    found = []
+    folder = REPO / "src" / "phylognn" / "training"
+    for name in ("trainer.py", "adapters.py"):
+        path = folder / name
+        if path.is_file() and any(g in path.read_text(encoding="utf-8") for g in OLD_E2_GUARDS):
+            backups = sorted(folder.glob(name + ".before_E2_V6_*"))
+            found.append(f"{path} (backups: {', '.join(b.name for b in backups) or 'none found'})")
+    return found
+
+
+def training_overrides(task: Dict, output_dir: Path, epochs=None, patience=None) -> Dict:
+    """Exactly Step 3's settings; only the dataset name differs."""
+    from phylognn.config import cli_overrides
+
+    is_author = task["model"] in e1.AUTHOR_MODELS
+    return cli_overrides(
+        dataset=task["dataset"],
+        dataset_config=None,
+        model=e1.config_model_name(task["model"]),
+        feature_mode=None if is_author else e1.FEATURE_MODE,
+        edge_mode=None,
+        epochs=epochs or e1.EPOCHS,
+        batch_size=e1.AUTHOR_BATCH_SIZE if is_author else e1.GNN_BATCH_SIZE,
+        learning_rate=e1.LEARNING_RATE,
+        seed=e1.SEED,
+        hidden_dim=None if is_author else e1.HIDDEN_DIM,
+        num_layers=None if is_author else e1.NUM_LAYERS,
+        dropout=None if is_author else e1.DROPOUT,
+        pooling=None if is_author else e1.POOLING,
+        attention_heads=None if is_author else e1.ATTENTION_HEADS,
+        sage_aggregation=None if is_author else e1.SAGE_AGGREGATION,
+        residual=False,
+        phylocnn_variant=e1.AUTHOR_VARIANT.get(task["model"]),
+        optimizer="adam",
+        patience=patience or e1.PATIENCE,
+        loss=None,  # repository default: MAPE for BD/BDEI/BDSS, MAE for BiSSE
+        max_trees=None,
+        validation_fraction=e1.VALIDATION_FRACTION,
+        output_dir=str(output_dir),
+        device="auto",
+        workers=None,
+        log_every=1,
+    )
+
+
+def preflight(args=None) -> None:
+    e1.ensure_project_layout()
+    e1.apply_runtime_environment()
+    e1.activate_repo_source()
+    e1.write_task_map()
+    banner("STEP 4 PREFLIGHT — FULL TRAINING DATA, AUTHORS' TEST SET HELD OUT")
+
+    from phylognn.config import build_config, validate_experiment
+    from phylognn.data.registry import dataset_status, discover_training
+    from phylognn.utils import find_project_root
+
+    failures, warnings = [], []
+    root = find_project_root()
+    if root.resolve() != REPO.resolve():
+        failures.append(f"phylognn resolves its project root to {root}, expected {REPO}")
+
+    for dataset in DATASETS:
+        m = read_manifest(dataset)
+        if m is None:
+            failures.append(f"{dataset}: not assembled — run --assemble")
+            continue
+        p, t = params_path(dataset), trees_path(dataset)
+        if not p.is_file() or not t.is_file():
+            failures.append(f"{dataset}: assembled files missing in {data_dir(dataset)}")
+            continue
+        if sha256(p) != m["parameters_sha256"] or sha256(t) != m["trees_sha256"]:
+            failures.append(f"{dataset}: training files changed after assembly — run --assemble --reassemble")
+            continue
+
+        found_params, found_trees, note = discover_training(root, dataset)
+        if (Path(found_params).resolve(), Path(found_trees).resolve()) != (p.resolve(), t.resolve()):
+            failures.append(f"{dataset}: the repository would train on {found_trees} / {found_params} "
+                            f"instead of {t} / {p} (files in data/{dataset}/ take precedence)")
+            continue
+
+        spec = repo_spec(dataset)
+        status = dataset_status(spec)
+        if status["status"] != "available":
+            failures.append(f"{dataset}: repository dataset status = {status['status']}")
+            continue
+
+        for model in ("author_phylocnn_2gen", "gcn", "ecc"):
+            task = {"task_id": -1, "dataset": dataset, "model": model}
+            cfg = build_config(None, training_overrides(task, RESULTS / "_preflight"))
+            errors, cfg_warnings = validate_experiment(cfg)
+            failures += [f"{dataset}/{model}: {e}" for e in errors]
+            warnings += [f"{dataset}/{model}: {w}" for w in cfg_warnings]
+
+        for variant in e1.AUTHOR_VARIANT.values():
+            try:
+                e1.find_author_json(dataset, variant)
+            except Exception as exc:
+                failures.append(f"{dataset}/{variant}: {exc}")
+
+        n_val = int(m["kept"] * e1.VALIDATION_FRACTION + 0.5)
+        say(f"[PASS] {dataset:5s} train pool {m['kept']:,} trees (~{m['kept'] - n_val:,} train / ~{n_val:,} "
+            f"validation; {m['excluded']:,} excluded) | test = {REPO / 'Test_Sets' / dataset}")
+
+    for edit in old_backend_edits():
+        warnings.append(
+            "the old Step 4 edited " + edit + ". Its code only runs when PHYLOGNN_E2_* variables are set, "
+            "which this Step 4 removes, but restoring the backup keeps the repository clean."
+        )
+
+    for w in warnings:
+        say("[WARN]", w)
+    if failures:
+        for f in failures:
+            say("[FAIL]", f)
+        raise SystemExit(f"[ERROR] preflight failed ({len(failures)} problem(s))")
+    say()
+    say("[PREFLIGHT PASSED] 4 datasets x 11 models = 44 tasks; same settings as Step 3")
+
+
+# =============================================================================
+# TRAINING WORKER
+# =============================================================================
+
+def run_training(task: Dict) -> Path:
+    e1.activate_repo_source()
+    if task["model"] in e1.OUR_MODELS:
+        e1.patch_spektral_keras3_compatibility()
+    e1.install_experiment_model_factory(task)
+
+    # Import config/training AFTER installing the patched factory (as in Step 3).
+    from phylognn.config import build_config, validate_experiment
+    from phylognn.training import run_experiment
+
+    output_dir = e1.task_result_root(task)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cfg = build_config(None, training_overrides(task, output_dir))
+    errors, warnings = validate_experiment(cfg)
+    for w in warnings:
+        print("[CONFIG WARNING]", w)
+    if errors:
+        raise RuntimeError("Configuration validation failed:\n" + "\n".join(errors))
+
+    is_author = task["model"] in e1.AUTHOR_MODELS
+    variant = e1.AUTHOR_VARIANT.get(task["model"])
+    m = read_manifest(task["dataset"])
+    raw_config = {
+        "experiment": "Experiment2_FullData",
+        "experiment_model": task["model"],
+        "dataset": task["dataset"],
+        "seed": e1.SEED,
+        "training_data": {"parameters": m["parameters_file"], "trees": m["trees_file"],
+                          "parameters_sha256": m["parameters_sha256"], "trees_sha256": m["trees_sha256"],
+                          "usable_trees": m["kept"]},
+        "test_data": str(REPO / "Test_Sets" / task["dataset"]),
+        "author_architecture": str(e1.find_author_json(task["dataset"], variant)) if is_author else None,
+        "released_author_weights_loaded": False if is_author else None,
+        "fixed_protocol": {
+            "epochs": e1.EPOCHS,
+            "learning_rate": e1.LEARNING_RATE,
+            "patience": e1.PATIENCE,
+            "validation_fraction": e1.VALIDATION_FRACTION,
+            "author_batch_size": e1.AUTHOR_BATCH_SIZE,
+            "gnn_batch_size": e1.GNN_BATCH_SIZE,
+        },
+    }
+    result = run_experiment(cfg, raw_config=raw_config)
+    if getattr(result, "status", None) != "SUCCESS":
+        raise RuntimeError(f"Training failed: {getattr(result, 'error', 'unknown error')}")
+    return Path(result.run_dir)
+
+
+def split_proof(run_dir: Path) -> Dict:
+    """Prove the test set is the authors' Test_Sets part, never the training pool."""
+    path = e1.find_run_file(run_dir, "split_indices.npz")
+    if path is None:
+        raise RuntimeError(f"split_indices.npz missing in {run_dir}")
+    with np.load(path, allow_pickle=False) as z:
+        train_role = str(z["train_role"])
+        test_role = str(z["test_role"])
+        if train_role != "train" or test_role != "test":
+            raise RuntimeError(f"unexpected split roles train={train_role!r} test={test_role!r}; "
+                               "the test set must be the separate Test_Sets part")
+        tv = hashlib.sha256()
+        for key in ("train_idx", "val_idx"):
+            tv.update(np.ascontiguousarray(z[key]).tobytes())
+        test = hashlib.sha256()
+        test.update(np.ascontiguousarray(z["test_idx"]).tobytes())
+        test.update("\n".join(map(str, z["test_sample_ids"])).encode())
+        overlap = np.intersect1d(z["train_idx"], z["val_idx"]).size
+        if overlap:
+            raise RuntimeError(f"{overlap} trees are in both train and validation")
+        return {
+            "split_file": str(path),
+            "train_size": int(len(z["train_idx"])),
+            "validation_size": int(len(z["val_idx"])),
+            "test_size": int(len(z["test_idx"])),
+            "train_validation_split_sha256": tv.hexdigest(),
+            "test_set_sha256": test.hexdigest(),
+        }
+
+
+def task_complete(task: Dict):
+    ok, reason = e1.validated_task_result(task)
+    if not ok:
+        return False, reason
+    meta = json.loads(e1.done_marker(task).read_text())
+    m = read_manifest(task["dataset"])
+    if m is None:
+        return False, "training data manifest missing"
+    if (meta.get("training_parameters_sha256"), meta.get("training_trees_sha256")) != \
+            (m["parameters_sha256"], m["trees_sha256"]):
+        return False, "trained on older assembled data"
+    return True, "validated SUCCESS"
+
+
+def worker(task_id: int) -> None:
+    for key in OLD_E2_ENV:
+        os.environ.pop(key, None)
+    e1.apply_runtime_environment()
+    e1.ensure_project_layout()
+    task = e1.get_task(task_id)
+    done, failed = e1.done_marker(task), e1.failed_marker(task)
+    done.parent.mkdir(parents=True, exist_ok=True)
+    failed.parent.mkdir(parents=True, exist_ok=True)
+
+    complete, reason = task_complete(task)
+    if complete:
+        say("[SKIP] validated completed result:", task)
+        return
+    if done.exists():
+        archive = STATE / "invalid_done_markers"
+        archive.mkdir(parents=True, exist_ok=True)
+        target = archive / f"{done.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{done.suffix}"
+        shutil.move(str(done), str(target))
+        say("[RERUN] archived invalid DONE marker:", target, "| reason:", reason)
+    failed.unlink(missing_ok=True)
+
+    m = read_manifest(task["dataset"])
+    if m is None:
+        raise SystemExit(f"[ERROR] {task['dataset']} not assembled — run --assemble first")
+
+    metadata = {
+        **task,
+        "experiment": "Experiment2_FullData",
+        "started": now(),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+        "seed": e1.SEED,
+        "execution_family": "AUTHOR_PHYLOCNN" if task["model"] in e1.AUTHOR_MODELS else "PHYLOGNN",
+        "python_executable": sys.executable,
+        "python_version": sys.version,
+        "training_parameters_sha256": m["parameters_sha256"],
+        "training_trees_sha256": m["trees_sha256"],
+        "training_pool_trees": m["kept"],
+        "test_source": str(REPO / "Test_Sets" / task["dataset"]),
+    }
+
+    try:
+        banner("STEP 4 — EXPERIMENT 2 WORKER (FULL DATA)")
+        say("Task    :", task_id)
+        say("Dataset :", task["dataset"], f"({m['kept']:,} simulated trees; test = authors' Test_Sets)")
+        say("Model   :", task["model"])
+        say("Seed    :", e1.SEED)
+        if task["model"] in e1.AUTHOR_MODELS:
+            author_json = e1.find_author_json(task["dataset"], e1.AUTHOR_VARIANT[task["model"]])
+            say("Author architecture:", author_json, "(released .h5 weights NOT loaded)")
+            metadata["author_json"] = str(author_json)
+            metadata["author_json_sha256"] = e1.sha256(author_json)
+            metadata["released_h5_loaded"] = False
+
+        run_dir = run_training(task)
+        metadata["run_dir"] = str(run_dir)
+        metadata.update(split_proof(run_dir))
+
+        metrics_csv = e1.find_run_file(run_dir, "metrics.csv")
+        predictions_csv = e1.find_run_file(run_dir, "predictions.csv")
+        history_csv = e1.find_run_file(run_dir, "training_history.csv")
+        if metrics_csv is None or predictions_csv is None:
+            raise RuntimeError("Training reported SUCCESS but metrics.csv/predictions.csv is missing")
+
+        root = e1.task_result_root(task)
+        stable = root / "TEST_METRICS.csv"
+        shutil.copy2(metrics_csv, stable)
+        extended_csv = root / "EXTENDED_TEST_METRICS.csv"
+        extended = e1.make_extended_metrics(predictions_csv, extended_csv)
+
+        metadata.update({
+            "metrics_csv": str(metrics_csv),
+            "predictions_csv": str(predictions_csv),
+            "training_history_csv": str(history_csv) if history_csv else None,
+            "stable_package_metrics": str(stable),
+            "extended_metrics_csv": str(extended_csv) if not extended.empty else None,
+            "evaluation_partition": "AUTHORS_TEST_SETS",
+            "status": "SUCCESS",
+            "finished": now(),
+        })
+        save_json(done, metadata)
+
+        banner("SUCCESS — scored on the authors' test set")
+        say("Run directory:", run_dir)
+        say(f"Train / validation / test: {metadata['train_size']:,} / {metadata['validation_size']:,} / "
+            f"{metadata['test_size']:,}")
+        say((extended if not extended.empty else pd.read_csv(stable)).to_string(index=False))
+
+    except BaseException as exc:
+        metadata.update({
+            "status": "FAILED",
+            "failed": now(),
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+            "traceback": traceback.format_exc(),
+        })
+        save_json(failed, metadata)
+        say(json.dumps(metadata, indent=2, default=str))
+        raise
+
+
+# =============================================================================
+# SHARED CACHE JOB (graphs + PhyloCNN encodings, once per dataset)
+# =============================================================================
+
+def cache_worker(dataset_index: int, workers: int) -> None:
+    for key in OLD_E2_ENV:
+        os.environ.pop(key, None)
+    e1.apply_runtime_environment()
+    e1.ensure_project_layout()
+    dataset = DATASETS[dataset_index]
+    banner(f"STEP 4 — BUILD SHARED CACHE: {dataset}")
+    e1.shell(
+        e1.phylognn_cli_command([
+            "prepare",
+            "--dataset", dataset,
+            "--feature-mode", e1.FEATURE_MODE,
+            "--workers", str(workers),
+            "--phylocnn",
+        ]),
+        cwd=SCRIPT_DIR,
+    )
+
+
+# =============================================================================
+# SLURM
+# =============================================================================
+
+def env_prefix(cpus: int) -> str:
+    return " ".join([
+        f"UV_CACHE_DIR={shlex.quote(str(e1.LOCAL_UV_CACHE))}",
+        f"UV_PROJECT_ENVIRONMENT={shlex.quote(str(e1.LOCAL_UV_ENV))}",
+        f"XDG_CACHE_HOME={shlex.quote(str(e1.LOCAL_XDG_CACHE))}",
+        f"TMPDIR={shlex.quote(str(e1.LOCAL_TMP))}",
+        f"MPLCONFIGDIR={shlex.quote(str(e1.LOCAL_XDG_CACHE / 'matplotlib'))}",
+        f"KERAS_HOME={shlex.quote(str(e1.LOCAL_XDG_CACHE / 'keras'))}",
+        f"PYTHONPATH={shlex.quote(os.pathsep.join((str(REPO / 'src'), str(SCRIPT_DIR))))}",
+        "PYTHONUNBUFFERED=1",
+        "TF_CPP_MIN_LOG_LEVEL=2",
+        f"OMP_NUM_THREADS={int(cpus)}",
+        f"TF_NUM_INTRAOP_THREADS={int(cpus)}",
+        "TF_NUM_INTEROP_THREADS=1",
+    ])
+
+
+def routed_worker_script(author_python: str, gnn_python: str) -> str:
+    """One array, two interpreters: author PhyloCNN tasks use the author environment."""
+    author_ids = "|".join(str(t["task_id"]) for t in e1.all_tasks() if t["model"] in e1.AUTHOR_MODELS)
+    script = shlex.quote(str(Path(__file__).resolve()))
+    return (
+        'echo "EXPERIMENT 2 (FULL DATA) | JOB $SLURM_JOB_ID | TASK $SLURM_ARRAY_TASK_ID | $(hostname) | $(date)"; '
+        "nvidia-smi || true; "
+        f'case "$SLURM_ARRAY_TASK_ID" in {author_ids}) PYTHON={shlex.quote(author_python)} ;; '
+        f"*) PYTHON={shlex.quote(gnn_python)} ;; esac; "
+        'echo "PYTHON: $PYTHON"; '
+        f'exec "$PYTHON" -u {script} --worker "$SLURM_ARRAY_TASK_ID"'
+    )
+
+
+def active_task_ids() -> Dict[int, str]:
+    user = os.environ.get("USER", "")
+    r = subprocess.run(["squeue", "-r", "-h", "-u", user, "-n", JOB_NAME, "-o", "%i|%T"],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if r.returncode != 0:
+        raise SystemExit("[ERROR] cannot read the Slurm queue; refusing to risk duplicate training jobs")
+    active = {}
+    for line in r.stdout.splitlines():
+        job, _, state = line.strip().partition("|")
+        if "_" in job:
+            try:
+                active[int(job.split("_", 1)[1])] = state
+            except ValueError:
+                pass
+    return active
+
+
+def sbatch(cmd: List[str], dry_run: bool) -> str:
+    if dry_run:
+        say("[DRY RUN]", shlex.join(cmd))
+        return "DRYRUN"
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=True)
+    return r.stdout.strip().split(";")[0]
+
+
+def submit(args) -> None:
+    preflight(args)
+    LOGS.mkdir(parents=True, exist_ok=True)
+    RESULTS.mkdir(parents=True, exist_ok=True)
+
+    selected = parse_ids(args.ids)
+    active = active_task_ids() if not args.dry_run else {}
+    ids = []
+    for i in selected:
+        task = e1.get_task(i)
+        if i in active:
+            say(f"[ACTIVE; NOT RESUBMITTED] {i:2d} {task['dataset']} {task['model']} ({active[i]})")
+            continue
+        complete, reason = task_complete(task)
+        if complete:
+            say(f"[DONE; SKIPPED] {i:2d} {task['dataset']} {task['model']}")
+            continue
+        ids.append(i)
+    if not ids:
+        say("[OK] Nothing to submit: selected tasks are complete or already queued.")
+        return
+
+    families = {"author" if e1.get_task(i)["model"] in e1.AUTHOR_MODELS else "graph" for i in ids}
+    author_python = e1._require_python(args.author_python, "AUTHOR PHYLOCNN") if "author" in families \
+        else args.author_python
+    gnn_python = e1._require_python(args.gnn_python, "PHYLOGNN")  # also builds the shared cache
+
+    dependency = []
+    if not args.no_cache_job:
+        datasets = sorted({DATASETS.index(e1.get_task(i)["dataset"]) for i in ids})
+        cache_cmd = [
+            "sbatch", "--parsable",
+            "--job-name", CACHE_JOB_NAME,
+            "--array", compact_ids(datasets),
+            "--partition", args.cache_partition,
+            "--nodes", "1", "--ntasks", "1",
+            "--cpus-per-task", str(args.cache_cpus),
+            "--mem", args.cache_mem,
+            "--time", args.cache_time,
+            "--chdir", str(SCRIPT_DIR),
+            "--output", str(LOGS / "%x.%A_%a.out"),
+            "--error", str(LOGS / "%x.%A_%a.err"),
+            "--wrap",
+            f"env {env_prefix(args.cache_cpus)} {shlex.quote(gnn_python)} -u "
+            f"{shlex.quote(str(Path(__file__).resolve()))} --cache-worker $SLURM_ARRAY_TASK_ID "
+            f"--cache-cpus {int(args.cache_cpus)}",
+        ]
+        cache_job = sbatch(cache_cmd, args.dry_run)
+        say(f"[{'WOULD SUBMIT' if args.dry_run else 'SUBMITTED'}] shared cache job {cache_job} for "
+            f"{', '.join(DATASETS[d] for d in datasets)} (training waits for it)")
+        # afterany: the cache only saves time; a failed cache job must not block training.
+        dependency = ["--dependency", f"afterany:{cache_job}"]
+
+    array = compact_ids(ids) + (f"%{args.max_parallel}" if args.max_parallel > 0 else "")
+    worker_command = f"env {env_prefix(args.cpus)} bash -lc " + shlex.quote(
+        routed_worker_script(author_python, gnn_python))
+    cmd = [
+        "sbatch", "--parsable",
+        "--job-name", JOB_NAME,
+        "--array", array,
+        "--partition", args.partition,
+        *(["--qos", args.qos] if args.qos else []),
+        "--nodes", "1", "--ntasks", "1",
+        "--cpus-per-task", str(args.cpus),
+        "--mem", args.mem,
+        "--time", args.time,
+        *(["--gres", args.gres] if args.gres else []),
+        *dependency,
+        "--chdir", str(SCRIPT_DIR),
+        "--output", str(LOGS / "%x.%A_%a.out"),
+        "--error", str(LOGS / "%x.%A_%a.err"),
+        "--wrap", worker_command,
+    ]
+    job = sbatch(cmd, args.dry_run)
+    if args.dry_run:
+        return
+
+    save_json(STATE / "last_submission.json", {
+        "submitted": now(), "job_id": job, "array": array, "tasks": len(ids),
+        "partition": args.partition, "qos": args.qos, "cpus": args.cpus, "mem": args.mem,
+        "time": args.time, "gres": args.gres, "author_python": author_python, "gnn_python": gnn_python,
+    })
+    say(f"[SUBMITTED] training job {job}: {len(ids)} task(s), array {array}")
+    say("Progress: python Step4_Experiment2_FullDataset.py --status")
+
+
+def cancel() -> None:
+    user = os.environ.get("USER")
+    if not user:
+        raise SystemExit("[ERROR] USER environment variable not set")
+    r = subprocess.run(["squeue", "-h", "-u", user, "-o", "%A|%j"], stdout=subprocess.PIPE, text=True, check=False)
+    ids = sorted({line.split("|", 1)[0] for line in r.stdout.splitlines()
+                  if line.split("|", 1)[-1] in (JOB_NAME, CACHE_JOB_NAME)})
+    if not ids:
+        say("[OK] No active Step 4 jobs.")
+        return
+    say("Cancelling:", " ".join(ids))
+    subprocess.run(["scancel", *ids], check=False)
+
+
+# =============================================================================
+# PLAN / STATUS / AGGREGATE
+# =============================================================================
+
+def plan() -> None:
+    e1.write_task_map()
+    banner("STEP 4 — EXPERIMENT 2 PLAN (FULL DATA)")
+    say("Training pool : Step 1 simulations -> PhyloGNN/Training_Data/<NAME>/ (invalid trees excluded)")
+    say(f"Split         : {100 - 100 * e1.VALIDATION_FRACTION:.0f}% train / "
+        f"{100 * e1.VALIDATION_FRACTION:.0f}% validation (seed {e1.SEED})")
+    say("Test          : PhyloGNN/Test_Sets/<NAME>/ — the authors' test set, untouched until the final score")
+    say(f"Settings      : identical to Step 3 (epochs<={e1.EPOCHS}, patience {e1.PATIENCE}, "
+        f"lr {e1.LEARNING_RATE}, batch {e1.AUTHOR_BATCH_SIZE} PhyloCNN / {e1.GNN_BATCH_SIZE} GNN)")
+    say()
+    for dataset in DATASETS:
+        m = read_manifest(dataset)
+        say(f"  {dataset:5s} " + (f"{m['kept']:,} usable trees" if m else "not assembled yet"))
+    say()
+    say(f"{'ID':>3}  {'DATASET':7s}  {'MODEL':28s}  FAMILY")
+    say("-" * 60)
+    for task in e1.all_tasks():
+        family = "AUTHOR" if task["model"] in e1.AUTHOR_MODELS else "OURS"
+        say(f"{task['task_id']:3d}  {task['dataset']:7s}  {task['model']:28s}  {family}")
+
+
+def status() -> None:
+    banner("STEP 4 — EXPERIMENT 2 (FULL DATA) | dashboard below uses the Step 3 layout")
+    stale = [t for t in e1.all_tasks()
+             if e1.done_marker(t).is_file() and not task_complete(t)[0]]
+    for t in stale:
+        say(f"[STALE] {t['task_id']:2d} {t['dataset']} {t['model']}: {task_complete(t)[1]} — will be rerun")
+    e1.status()
+
+
+def aggregate() -> None:
+    records, frames, extended_frames = [], [], []
+    for task in e1.all_tasks():
+        ok, _ = task_complete(task)
+        if not ok:
+            continue
+        rec = json.loads(e1.done_marker(task).read_text())
+        records.append(rec)
+        for path, sink in ((rec.get("stable_package_metrics"), frames),
+                           (rec.get("extended_metrics_csv"), extended_frames)):
+            if path and Path(path).is_file():
+                df = pd.read_csv(path)
+                df.insert(0, "Model", task["model"])
+                df.insert(0, "Dataset", task["dataset"])
+                df.insert(0, "TaskID", task["task_id"])
+                df.insert(3, "TestSize", rec.get("test_size"))
+                sink.append(df)
+
+    # Every model of a dataset must have been scored on the same test trees.
+    problems = []
+    for dataset in DATASETS:
+        recs = [r for r in records if r["dataset"] == dataset]
+        for key in ("test_set_sha256", "train_validation_split_sha256"):
+            values = {r.get(key) for r in recs}
+            if len(values) > 1:
+                problems.append(f"{dataset}: models disagree on {key}")
+
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    save_json(RESULTS / "Experiment2_RunManifest.json", records)
+    if frames:
+        pd.concat(frames, ignore_index=True, sort=False).to_csv(RESULTS / "Experiment2_TestMetrics.csv",
+                                                                index=False)
+    if extended_frames:
+        pd.concat(extended_frames, ignore_index=True, sort=False).to_csv(
+            RESULTS / "Experiment2_ExtendedTestMetrics.csv", index=False)
+
+    banner("STEP 4 — AGGREGATION (scores on the authors' test sets)")
+    say(f"Completed runs: {len(records)}/{len(e1.all_tasks())}")
+    say("Output folder :", RESULTS)
+    for p in problems:
+        say("[WARN]", p)
+    if not problems and records:
+        say("[OK] Within each dataset, all completed models share the same split and the same test trees.")
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def main():
+    p = argparse.ArgumentParser(description="Step 4 — Experiment 2 on the full simulated training data")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--plan", action="store_true")
+    g.add_argument("--assemble", action="store_true", help="Join Step 1 chunks into PhyloGNN/Training_Data/")
+    g.add_argument("--preflight", action="store_true")
+    g.add_argument("--submit", action="store_true", help="Submit every incomplete task (or only --ids)")
+    g.add_argument("--status", action="store_true")
+    g.add_argument("--watch", action="store_true")
+    g.add_argument("--aggregate", action="store_true")
+    g.add_argument("--cancel", action="store_true")
+    g.add_argument("--worker", type=int, help=argparse.SUPPRESS)
+    g.add_argument("--cache-worker", type=int, help=argparse.SUPPRESS)
+
+    p.add_argument("--step1-chunks", default=str(DEFAULT_STEP1_CHUNKS),
+                   help="Step 1 chunk folder (default: .step1_generate_data/chunks)")
+    p.add_argument("--reassemble", action="store_true",
+                   help="With --assemble: archive existing Training_Data/<NAME> files and rebuild")
+    p.add_argument("--ids", default="", help="Task ids, e.g. 0,3 or 0-10 (default: all 44)")
+    p.add_argument("--dry-run", action="store_true", help="Print sbatch commands without submitting")
+    p.add_argument("--max-parallel", type=int, default=8)
+    p.add_argument("--partition", default="ascher")
+    p.add_argument("--qos", default="gpu")
+    p.add_argument("--cpus", type=int, default=4)
+    p.add_argument("--mem", default="120G")
+    p.add_argument("--time", default="48:00:00")
+    p.add_argument("--gres", default="gpu:1")
+    p.add_argument("--no-cache-job", action="store_true",
+                   help="Skip the shared cache job (each training job then encodes its own trees)")
+    p.add_argument("--cache-partition", default="general")
+    p.add_argument("--cache-cpus", type=int, default=16)
+    p.add_argument("--cache-mem", default="96G")
+    p.add_argument("--cache-time", default="24:00:00")
+    p.add_argument("--author-python", default=e1.DEFAULT_AUTHOR_PYTHON)
+    p.add_argument("--gnn-python", default=e1.DEFAULT_GNN_PYTHON)
+    p.add_argument("--watch-seconds", type=int, default=20)
+    args = p.parse_args()
+
+    if args.plan:
+        plan()
+    elif args.assemble:
+        assemble(args)
+    elif args.preflight:
+        preflight(args)
+    elif args.submit:
+        submit(args)
+    elif args.status:
+        status()
+    elif args.watch:
+        e1.watch_status(args.watch_seconds)
+    elif args.aggregate:
+        aggregate()
+    elif args.cancel:
+        cancel()
+    elif args.worker is not None:
+        worker(args.worker)
+    elif args.cache_worker is not None:
+        cache_worker(args.cache_worker, args.cache_cpus)
+
+
+if __name__ == "__main__":
+    main()

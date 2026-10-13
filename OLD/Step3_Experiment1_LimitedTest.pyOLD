@@ -1,0 +1,3954 @@
+#!/usr/bin/env python3
+"""
+Step3_Experiment1_LimitedTest.py
+
+EXPERIMENT 1 — LIMITED-DATA BENCHMARK ON THE AUTHORS' SHIPPED TEST SETS
+
+Datasets:
+  BD-shipped
+  BDEI-shipped
+  BDSS-shipped
+  BiSSE-shipped
+
+Models:
+  AUTHORS' PHYLOCNN (exact released architecture JSON; fresh weights)
+    1. author_phylocnn_2gen
+    2. author_phylocnn_1gen
+    3. author_phylocnn_nocontext
+
+  OUR GRAPH MODELS (GNNArchitectures.py, Step 2)
+    4. gcn
+    5. graphsage
+    6. gat
+    7. gin
+    8. ecc
+    9. trignn
+   10. gnn_fusion
+   11. graphsage_gat_fusion
+
+Total jobs:
+  4 datasets x 11 models = 44 Slurm array jobs
+
+Protocol:
+  - one fixed split per dataset
+  - no cross-validation
+  - test fraction follows the PhyloGNN shipped-dataset protocol
+  - validation_fraction=0.30 inside the non-test portion
+    -> 56/24/20 train/validation/test when the shipped dataset is one pool
+  - seed=42 for every model
+  - same split file/hash must be shared across all 11 models within a dataset
+  - PhyloCNN uses the authors' released JSON architecture definition, NOT our CNN
+  - PhyloCNN weights are freshly initialized; released .h5 weights are NOT loaded
+  - all models are trained from scratch on the same limited-data experiment
+
+Commands:
+  python Step3_Experiment1_LimitedTest.py --plan
+  python Step3_Experiment1_LimitedTest.py --preflight
+  python Step3_Experiment1_LimitedTest.py --submit
+  python Step3_Experiment1_LimitedTest.py --status
+  python Step3_Experiment1_LimitedTest.py --resume
+  python Step3_Experiment1_LimitedTest.py --aggregate
+  python Step3_Experiment1_LimitedTest.py --cancel
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+# =============================================================================
+# EXPERIMENT SETTINGS
+# =============================================================================
+
+DATASETS = (
+    "BD-shipped",
+    "BDEI-shipped",
+    "BDSS-shipped",
+    "BiSSE-shipped",
+)
+
+AUTHOR_MODELS = (
+    "author_phylocnn_2gen",
+    "author_phylocnn_1gen",
+    "author_phylocnn_nocontext",
+)
+
+OUR_MODELS = (
+    "gcn",
+    "graphsage",
+    "gat",
+    "gin",
+    "ecc",
+    "trignn",
+    "gnn_fusion",
+    "graphsage_gat_fusion",
+)
+
+ALL_MODELS = AUTHOR_MODELS + OUR_MODELS
+
+AUTHOR_VARIANT = {
+    "author_phylocnn_2gen": "2gen",
+    "author_phylocnn_1gen": "1gen",
+    "author_phylocnn_nocontext": "nocontext",
+}
+
+AUTHOR_JSON_TAG = {
+    "2gen": "2Generation",
+    "1gen": "1Generation",
+    "nocontext": "NoContext",
+}
+
+# Fair, fixed experiment settings.
+SEED = 42
+EPOCHS = 1000
+LEARNING_RATE = 0.001
+PATIENCE = 100
+VALIDATION_FRACTION = 0.30
+
+# Original PhyloCNN notebooks train with batch_size=1024.
+AUTHOR_BATCH_SIZE = 1024
+
+# Common graph-model mini-batch.
+GNN_BATCH_SIZE = 64
+
+FEATURE_MODE = "minimal"
+HIDDEN_DIM = 32
+NUM_LAYERS = 3
+DROPOUT = 0.1
+POOLING = "mean"
+ATTENTION_HEADS = 4
+SAGE_AGGREGATION = "mean"
+
+
+JOB_NAME = "PhyloGNN_E1"
+
+# Separate execution environments used by --resume.
+# Override with CLI flags if your paths differ.
+DEFAULT_GNN_PYTHON = os.environ.get(
+    "PHYLOGNN_PYTHON",
+    sys.executable,
+)
+
+DEFAULT_AUTHOR_PYTHON = os.environ.get(
+    "PHYLOCNN_AUTHOR_PYTHON",
+    "/data/ascher01/uqmmune1/miniconda3/envs/phylocnn-author/bin/python",
+)
+
+
+# =============================================================================
+# PATHS
+# =============================================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO = (SCRIPT_DIR / "PhyloGNN").resolve()
+STEP2 = SCRIPT_DIR / "GNNArchitectures.py"
+STATE = SCRIPT_DIR / ".step3_experiment1"
+LOGS = STATE / "logs"
+RESULTS = SCRIPT_DIR / "results" / "Experiment1_LimitedTest"
+TASK_MAP = STATE / "task_map.tsv"
+
+# Keep every build/cache/temp artefact under the CURRENT working project directory.
+LOCAL_UV_CACHE = SCRIPT_DIR / ".uv-cache"
+LOCAL_UV_ENV = SCRIPT_DIR / ".venv"
+LOCAL_XDG_CACHE = SCRIPT_DIR / ".cache"
+LOCAL_TMP = SCRIPT_DIR / ".tmp"
+
+
+def runtime_env() -> Dict[str, str]:
+    """Runtime environment with NO writes to ~/.cache or other home-cache paths."""
+    for path in (LOCAL_UV_CACHE, LOCAL_UV_ENV, LOCAL_XDG_CACHE, LOCAL_TMP):
+        path.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    env["UV_CACHE_DIR"] = str(LOCAL_UV_CACHE)
+    env["UV_PROJECT_ENVIRONMENT"] = str(LOCAL_UV_ENV)
+    env["XDG_CACHE_HOME"] = str(LOCAL_XDG_CACHE)
+    env["TMPDIR"] = str(LOCAL_TMP)
+    env["MPLCONFIGDIR"] = str(LOCAL_XDG_CACHE / "matplotlib")
+    env["KERAS_HOME"] = str(LOCAL_XDG_CACHE / "keras")
+
+    local_pythonpath = os.pathsep.join((str(REPO / "src"), str(SCRIPT_DIR)))
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = local_pythonpath + (os.pathsep + existing if existing else "")
+    return env
+
+
+def ensure_project_layout() -> None:
+    missing = []
+    if not REPO.is_dir():
+        missing.append(str(REPO))
+    if not STEP2.is_file():
+        missing.append(str(STEP2))
+    if missing:
+        raise SystemExit(
+            "[ERROR] Missing required files/directories:\n  "
+            + "\n  ".join(missing)
+            + "\nExpected Step3 to live in PhyloGNN_FINAL beside PhyloGNN/ and GNNArchitectures.py"
+        )
+
+
+def activate_repo_source() -> None:
+    """Make the local PhyloGNN package importable from the source checkout."""
+    src = str(REPO / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    parent = str(SCRIPT_DIR)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+
+
+def apply_runtime_environment() -> None:
+    """Apply local cache/temp/PYTHONPATH settings to this process."""
+    env = runtime_env()
+    for key in (
+        "UV_CACHE_DIR",
+        "UV_PROJECT_ENVIRONMENT",
+        "XDG_CACHE_HOME",
+        "TMPDIR",
+        "MPLCONFIGDIR",
+        "KERAS_HOME",
+        "PYTHONPATH",
+    ):
+        os.environ[key] = env[key]
+
+
+def phylognn_cli_command(arguments: Sequence[str]) -> List[str]:
+    """Run the local phylognn CLI through the current Python interpreter.
+
+    This deliberately avoids `uv run` and package installation. The package is
+    imported directly from PhyloGNN/src.
+    """
+    args = [str(x) for x in arguments]
+    code = (
+        "import sys;"
+        f"sys.path.insert(0,{str(REPO / 'src')!r});"
+        "import phylognn.cli as c;"
+        f"sys.argv=['phylognn']+{args!r};"
+        "runner=(getattr(c,'main',None) or getattr(c,'app',None) or getattr(c,'cli',None));"
+        "assert runner is not None, 'phylognn.cli exposes no main/app/cli entry point';"
+        "runner()"
+    )
+    return [sys.executable, "-c", code]
+
+
+# =============================================================================
+# TASKS
+# =============================================================================
+
+def all_tasks() -> List[Dict]:
+    tasks = []
+    task_id = 0
+    for dataset in DATASETS:
+        for model in ALL_MODELS:
+            tasks.append(
+                {
+                    "task_id": task_id,
+                    "dataset": dataset,
+                    "model": model,
+                }
+            )
+            task_id += 1
+    return tasks
+
+
+def get_task(task_id: int) -> Dict:
+    tasks = all_tasks()
+    if task_id < 0 or task_id >= len(tasks):
+        raise SystemExit(f"[ERROR] task id must be 0..{len(tasks)-1}")
+    return tasks[task_id]
+
+
+def task_slug(task: Dict) -> str:
+    return f"{task['task_id']:02d}_{task['dataset']}_{task['model']}"
+
+
+def task_result_root(task: Dict) -> Path:
+    return RESULTS / task["dataset"] / task["model"]
+
+
+def done_marker(task: Dict) -> Path:
+    return STATE / "done" / f"{task_slug(task)}.json"
+
+
+def failed_marker(task: Dict) -> Path:
+    return STATE / "failed" / f"{task_slug(task)}.json"
+
+
+def write_task_map() -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    with TASK_MAP.open("w", newline="") as handle:
+        w = csv.writer(handle, delimiter="\t")
+        w.writerow(["task_id", "dataset", "model", "family"])
+        for task in all_tasks():
+            family = "AUTHOR_PHYLOCNN" if task["model"] in AUTHOR_MODELS else "PHYLOGNN"
+            w.writerow([task["task_id"], task["dataset"], task["model"], family])
+
+
+# =============================================================================
+# AUTHOR PHYLOCNN — EXACT RELEASED ARCHITECTURE
+# =============================================================================
+
+def dataset_base(dataset: str) -> str:
+    return dataset.replace("-shipped", "")
+
+
+def author_notebook(dataset: str) -> Path:
+    base = dataset_base(dataset)
+    return REPO / "Preprocessing_Training" / f"PhyloCNN_Train_{base}.ipynb"
+
+
+def find_author_json(dataset: str, variant: str) -> Path:
+    """
+    Find the JSON model architecture released by the PhyloCNN authors.
+
+    We deliberately load only JSON architecture.
+    We DO NOT load their .h5 weights for Experiment 1.
+    """
+    base = dataset_base(dataset)
+    tag = AUTHOR_JSON_TAG[variant]
+    root = REPO / "Trained_Models"
+
+    exact_name = f"Trained_{tag}_{base}.json"
+    matches = list(root.rglob(exact_name))
+
+    if not matches:
+        # Case-insensitive fallback.
+        wanted = exact_name.lower()
+        matches = [p for p in root.rglob("*.json") if p.name.lower() == wanted]
+
+    if len(matches) != 1:
+        raise FileNotFoundError(
+            f"Expected exactly one author architecture JSON for {dataset}/{variant}: "
+            f"{exact_name}; found {len(matches)} under {root}"
+        )
+    return matches[0]
+
+
+def verify_author_notebook_contains_original_model(dataset: str) -> Dict:
+    """
+    Audit-only check proving the local notebook contains the authors' model definition.
+
+    This does not execute the notebook.
+    """
+    notebook = author_notebook(dataset)
+    if not notebook.is_file():
+        raise FileNotFoundError(notebook)
+
+    obj = json.loads(notebook.read_text(errors="replace"))
+    source = "\n".join(
+        "".join(cell.get("source", []))
+        for cell in obj.get("cells", [])
+        if cell.get("cell_type") == "code"
+    )
+
+    checks = {
+        "has_build_model": "def build_model" in source,
+        "has_encode_pad": "def encode_pad_0s_rootage" in source,
+        "has_grouped_conv": "groups=2" in source,
+        "has_global_average_pool": "GlobalAveragePooling2D" in source,
+        "has_dense_64": "Dense(64" in source,
+        "has_dense_32": "Dense(32" in source,
+        "has_dense_16": "Dense(16" in source,
+        "has_dense_8": "Dense(8" in source,
+    }
+
+    if not all(checks.values()):
+        missing = [k for k, v in checks.items() if not v]
+        raise RuntimeError(
+            f"Author notebook audit failed for {dataset}: missing {missing}"
+        )
+
+    return checks
+
+
+
+def load_legacy_keras2_sequential_json(json_path: Path):
+    """
+    Load the PhyloCNN authors' Keras-2 Sequential JSON under Keras 3.
+
+    IMPORTANT
+    ---------
+    This does NOT invent or modify the PhyloCNN architecture.
+
+    The released PhyloCNN JSON files were created with Keras 2.8.0.
+    Modern Keras 3 cannot directly deserialize that legacy JSON with
+    keras.models.model_from_json().
+
+    We therefore reconstruct the exact built-in layer configuration
+    contained in the authors' JSON:
+
+        InputLayer
+        Conv2D
+        BatchNormalization
+        GlobalAveragePooling2D
+        Dense
+        etc.
+
+    No released .h5 weights are loaded.
+    All weights remain freshly initialized for the present benchmark.
+    """
+
+    import json
+    from tensorflow import keras
+
+    json_path = Path(json_path)
+
+    raw = json.loads(
+        json_path.read_text()
+    )
+
+    # -------------------------------------------------------------------------
+    # EXPECT AUTHORS' SEQUENTIAL MODEL
+    # -------------------------------------------------------------------------
+
+    class_name = raw.get(
+        "class_name"
+    )
+
+    if class_name != "Sequential":
+
+        raise RuntimeError(
+            f"Expected authors' Sequential model in {json_path}, "
+            f"but found class_name={class_name!r}"
+        )
+
+    config = raw.get(
+        "config",
+        {}
+    )
+
+    layer_specs = config.get(
+        "layers",
+        []
+    )
+
+    if not layer_specs:
+
+        raise RuntimeError(
+            f"No layers found in authors' JSON: {json_path}"
+        )
+
+    # -------------------------------------------------------------------------
+    # NEW KERAS-3 SEQUENTIAL CONTAINER
+    # -------------------------------------------------------------------------
+
+    model = keras.Sequential(
+        name=config.get(
+            "name",
+            "sequential"
+        )
+    )
+
+    supported_layers = {
+        "InputLayer",
+        "Conv2D",
+        "BatchNormalization",
+        "GlobalAveragePooling2D",
+        "Dense",
+        "Dropout",
+        "Flatten",
+        "Activation",
+    }
+
+    # -------------------------------------------------------------------------
+    # RECONSTRUCT AUTHORS' LAYERS EXACTLY
+    # -------------------------------------------------------------------------
+
+    for layer_index, layer_spec in enumerate(
+        layer_specs
+    ):
+
+        layer_class = layer_spec.get(
+            "class_name"
+        )
+
+        layer_config = dict(
+            layer_spec.get(
+                "config",
+                {}
+            )
+        )
+
+        if layer_class not in supported_layers:
+
+            raise RuntimeError(
+                f"Unsupported legacy layer {layer_class!r} "
+                f"in authors' model {json_path}.\n"
+                f"Supported: {sorted(supported_layers)}"
+            )
+
+        # =====================================================================
+        # INPUT LAYER
+        #
+        # Keras 2:
+        #     batch_input_shape
+        #
+        # Keras 3:
+        #     shape
+        # =====================================================================
+
+        if layer_class == "InputLayer":
+
+            batch_shape = layer_config.pop(
+                "batch_input_shape",
+                layer_config.pop(
+                    "batch_shape",
+                    None
+                ),
+            )
+
+            kwargs = {
+                "dtype":
+                    layer_config.get(
+                        "dtype",
+                        "float32"
+                    ),
+
+                "sparse":
+                    layer_config.get(
+                        "sparse",
+                        False
+                    ),
+
+                "name":
+                    layer_config.get(
+                        "name",
+                        f"input_{layer_index}"
+                    ),
+            }
+
+            if batch_shape is not None:
+
+                kwargs[
+                    "shape"
+                ] = tuple(
+                    batch_shape[1:]
+                )
+
+            # Some Keras builds accept ragged; others do not.
+            if layer_config.get(
+                "ragged",
+                False
+            ):
+
+                kwargs[
+                    "ragged"
+                ] = True
+
+            try:
+
+                layer = (
+                    keras.layers.InputLayer(
+                        **kwargs
+                    )
+                )
+
+            except TypeError:
+
+                kwargs.pop(
+                    "ragged",
+                    None
+                )
+
+                layer = (
+                    keras.layers.InputLayer(
+                        **kwargs
+                    )
+                )
+
+            model.add(
+                layer
+            )
+
+            continue
+
+        # =====================================================================
+        # REMOVE LEGACY INPUT SHAPE FROM NORMAL LAYERS
+        # =====================================================================
+
+        layer_config.pop(
+            "batch_input_shape",
+            None
+        )
+
+        layer_config.pop(
+            "batch_shape",
+            None
+        )
+
+        # =====================================================================
+        # KERAS-2 BATCHNORM AXIS
+        #
+        # Authors' JSON:
+        #     axis: [3]
+        #
+        # Modern Keras:
+        #     axis: 3
+        # =====================================================================
+
+        if (
+            layer_class
+            ==
+            "BatchNormalization"
+        ):
+
+            axis = layer_config.get(
+                "axis"
+            )
+
+            if (
+                isinstance(
+                    axis,
+                    list
+                )
+                and
+                len(axis) == 1
+            ):
+
+                layer_config[
+                    "axis"
+                ] = axis[0]
+
+        # =====================================================================
+        # BUILD EXACT BUILT-IN KERAS LAYER
+        # =====================================================================
+
+        layer_type = getattr(
+            keras.layers,
+            layer_class,
+            None
+        )
+
+        if layer_type is None:
+
+            raise RuntimeError(
+                f"Keras 3 does not provide layer "
+                f"{layer_class!r}"
+            )
+
+        try:
+
+            layer = (
+                layer_type.from_config(
+                    layer_config
+                )
+            )
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "\nFailed converting one layer from "
+                "the authors' Keras-2 JSON.\n"
+                f"JSON       : {json_path}\n"
+                f"Layer index: {layer_index}\n"
+                f"Layer type : {layer_class}\n"
+                f"Config     : {layer_config}\n"
+                f"Original error: {exc}"
+            ) from exc
+
+        model.add(
+            layer
+        )
+
+    # -------------------------------------------------------------------------
+    # VERIFY MODEL BUILT
+    # -------------------------------------------------------------------------
+
+    try:
+
+        input_shape = (
+            model.input_shape
+        )
+
+        output_shape = (
+            model.output_shape
+        )
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            f"Authors' model could not be built from "
+            f"{json_path}: {exc}"
+        ) from exc
+
+    print(
+        "[AUTHOR MODEL] Keras-2 JSON converted successfully"
+    )
+
+    print(
+        "[AUTHOR MODEL] source Keras version:",
+        raw.get(
+            "keras_version",
+            "unknown"
+        ),
+    )
+
+    print(
+        "[AUTHOR MODEL] input shape :",
+        input_shape,
+    )
+
+    print(
+        "[AUTHOR MODEL] output shape:",
+        output_shape,
+    )
+
+    print(
+        "[AUTHOR MODEL] layers      :",
+        len(
+            model.layers
+        ),
+    )
+
+    return model
+
+
+def build_author_phylocnn(dataset, dataset_name: str, variant: str):
+    """
+    Construct the literal model architecture serialized by the PhyloCNN authors.
+
+    model_from_json() creates new random weights.
+    No released .h5 weights are loaded.
+    """
+    import tensorflow as tf
+    from tensorflow import keras
+
+    json_path = find_author_json(
+        dataset_name,
+        variant,
+    )
+
+    print(
+        "[AUTHOR MODEL] loading architecture JSON only:",
+        json_path,
+    )
+
+    print(
+        "[AUTHOR MODEL] released .h5 weights are NOT loaded"
+    )
+
+    model = load_legacy_keras2_sequential_json(
+        json_path
+    )
+
+    # Metadata for our experiment/checkpoint record.
+    model.phylognn_meta = {
+        "model_type": "phylocnn",
+        "variant": variant,
+        "encoder": dataset.task.encoder,
+        "architecture_source": "PHYLOCNN_AUTHORS_RELEASED_JSON",
+        "architecture_json": str(json_path),
+        "released_weights_loaded": False,
+        "training": "FROM_SCRATCH",
+    }
+
+    # Strong shape check: author's JSON must match the requested variant.
+    feature_width = int(model.input_shape[2])
+    base = dataset_base(dataset_name)
+
+    if base == "BiSSE":
+        expected = {"2gen": 20, "1gen": 11, "nocontext": 6}[variant]
+    else:
+        expected = {"2gen": 19, "1gen": 10, "nocontext": 5}[variant]
+
+    if feature_width != expected:
+        raise RuntimeError(
+            f"Author JSON input width mismatch for {dataset_name}/{variant}: "
+            f"model={feature_width}, expected={expected}"
+        )
+
+    return model
+
+
+# =============================================================================
+# PATCH MODEL FACTORY FOR THIS ONE TRAINING PROCESS
+# =============================================================================
+
+def install_experiment_model_factory(task: Dict):
+    """
+    Install only the model factory required by the current task.
+
+    IMPORTANT:
+      - AUTHOR PHYLOCNN tasks NEVER import GNNArchitectures.py (Step 2).
+      - OUR graph-model tasks import Step2 only when required.
+
+    This keeps the authors' legacy Keras path independent from the custom
+    Keras/Spektral graph-model path.
+    """
+    activate_repo_source()
+
+    import phylognn.models as model_module
+    import importlib
+
+    architecture = task["model"]
+    dataset_name = task["dataset"]
+    original_builder = model_module.build_model
+
+    step2 = None
+
+    if architecture in OUR_MODELS:
+        import GNNArchitectures as step2
+
+    def patched_build_model(model_type, dataset=None, *args, **kwargs):
+        if architecture in AUTHOR_MODELS:
+            if dataset is None:
+                raise RuntimeError("Author PhyloCNN requires dataset object")
+
+            variant = AUTHOR_VARIANT[architecture]
+
+            return build_author_phylocnn(
+                dataset,
+                dataset_name,
+                variant,
+            )
+
+        if architecture in OUR_MODELS:
+            return step2.build_graph_model(
+                architecture,
+                dataset=dataset,
+                **kwargs,
+            )
+
+        return original_builder(
+            model_type,
+            dataset,
+            *args,
+            **kwargs,
+        )
+
+    model_module.build_model = patched_build_model
+
+    adapters_module = importlib.import_module(
+        "phylognn.training.adapters"
+    )
+
+    adapters_module.build_model = patched_build_model
+
+    print(
+        "[MODEL FACTORY]",
+        (
+            "AUTHOR_PHYLOCNN isolated"
+            if architecture in AUTHOR_MODELS
+            else "PHYLOGNN isolated"
+        ),
+        "|",
+        architecture,
+        flush=True,
+    )
+
+    return original_builder
+
+# =============================================================================
+# CONFIG / TRAINING
+# =============================================================================
+
+def config_model_name(experiment_model: str) -> str:
+    """
+    Use an existing recognised model type for configuration/adaptation.
+
+    Custom fusion models use GraphSAGE as the adapter proxy because they consume
+    the same common graph batch; Step2 replaces only the actual model builder.
+    """
+    if experiment_model in AUTHOR_MODELS:
+        return "phylocnn"
+    if experiment_model in ("trignn", "gnn_fusion", "graphsage_gat_fusion"):
+        return "graphsage"
+    return experiment_model
+
+
+
+def patch_spektral_keras3_compatibility():
+    """
+    Compatibility patch for Spektral 1.3.1 under modern Keras 3.
+
+    Keras 3 can automatically pass:
+
+        mask=[None, None, None]
+
+    to ECCConv.call().
+
+    Spektral checks only:
+
+        if mask is not None:
+            output *= mask[0]
+
+    which becomes:
+
+        output *= None
+
+    and crashes.
+
+    Convert an all-None mask list to mask=None before entering
+    the original ECCConv implementation.
+
+    This does NOT modify the ECC architecture or computation.
+    """
+
+    try:
+        from spektral.layers import ECCConv
+    except ImportError:
+        from spektral.layers.convolutional.ecc_conv import ECCConv
+
+    if getattr(
+        ECCConv,
+        "_phylognn_keras3_mask_patch",
+        False,
+    ):
+        return
+
+    original_call = ECCConv.call
+
+    def compatible_call(
+        self,
+        inputs,
+        mask=None,
+        **kwargs,
+    ):
+
+        if isinstance(mask, (list, tuple)):
+
+            if all(
+                item is None
+                for item in mask
+            ):
+                mask = None
+
+        return original_call(
+            self,
+            inputs,
+            mask=mask,
+            **kwargs,
+        )
+
+    ECCConv.call = compatible_call
+
+    ECCConv._phylognn_keras3_mask_patch = True
+
+    print(
+        "[KERAS3 COMPAT] "
+        "Spektral ECCConv all-None mask handling patched",
+        flush=True,
+    )
+
+
+def run_training(task: Dict):
+    activate_repo_source()
+
+    # Keep the author PhyloCNN process independent of the Spektral/Keras
+    # compatibility path used by our graph models.
+    if task["model"] in OUR_MODELS:
+        patch_spektral_keras3_compatibility()
+
+    install_experiment_model_factory(task)
+
+    # IMPORTANT: import config/training AFTER installing the patched factory.
+    from phylognn.config import build_config, cli_overrides, validate_experiment
+    from phylognn.training import run_experiment
+
+    architecture = task["model"]
+    dataset = task["dataset"]
+    output_dir = task_result_root(task)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    is_author = architecture in AUTHOR_MODELS
+    proxy_model = config_model_name(architecture)
+    variant = AUTHOR_VARIANT.get(architecture)
+
+    batch_size = AUTHOR_BATCH_SIZE if is_author else GNN_BATCH_SIZE
+
+    overrides = cli_overrides(
+        dataset=dataset,
+        dataset_config=None,
+        model=proxy_model,
+        feature_mode=None if is_author else FEATURE_MODE,
+        edge_mode=None,
+        epochs=EPOCHS,
+        batch_size=batch_size,
+        learning_rate=LEARNING_RATE,
+        seed=SEED,
+        hidden_dim=None if is_author else HIDDEN_DIM,
+        num_layers=None if is_author else NUM_LAYERS,
+        dropout=None if is_author else DROPOUT,
+        pooling=None if is_author else POOLING,
+        attention_heads=None if is_author else ATTENTION_HEADS,
+        sage_aggregation=None if is_author else SAGE_AGGREGATION,
+        residual=False,
+        phylocnn_variant=variant,
+        optimizer="adam",
+        patience=PATIENCE,
+        loss=None,  # dataset default: MAPE for BD/BDEI/BDSS, MAE for BiSSE
+        max_trees=None,
+        validation_fraction=VALIDATION_FRACTION,
+        output_dir=str(output_dir),
+        device="auto",
+        workers=None,
+        log_every=1,
+    )
+
+    cfg = build_config(None, overrides)
+    errors, warnings = validate_experiment(cfg)
+
+    for warning in warnings:
+        print("[CONFIG WARNING]", warning)
+
+    if errors:
+        raise RuntimeError("Configuration validation failed:\n" + "\n".join(errors))
+
+    raw_config = {
+        "experiment": "Experiment1_LimitedTest",
+        "experiment_model": architecture,
+        "dataset": dataset,
+        "seed": SEED,
+        "author_architecture": (
+            str(find_author_json(dataset, variant))
+            if is_author else None
+        ),
+        "released_author_weights_loaded": False if is_author else None,
+        "fixed_protocol": {
+            "epochs": EPOCHS,
+            "learning_rate": LEARNING_RATE,
+            "patience": PATIENCE,
+            "validation_fraction": VALIDATION_FRACTION,
+            "author_batch_size": AUTHOR_BATCH_SIZE,
+            "gnn_batch_size": GNN_BATCH_SIZE,
+        },
+    }
+
+    try:
+        result = run_experiment(cfg, raw_config=raw_config)
+    except TypeError:
+        # Compatibility fallback if an older local run_experiment lacks raw_config.
+        result = run_experiment(cfg)
+
+    if getattr(result, "status", None) != "SUCCESS":
+        raise RuntimeError(
+            f"Training failed: {getattr(result, 'error', 'unknown error')}"
+        )
+
+    return Path(result.run_dir)
+
+
+# =============================================================================
+# METRICS
+# =============================================================================
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def safe_corr(a: np.ndarray, b: np.ndarray, method: str) -> float:
+    if len(a) < 2:
+        return float("nan")
+    sa = pd.Series(a)
+    sb = pd.Series(b)
+    return float(sa.corr(sb, method=method))
+
+
+def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true = np.asarray(y_true, dtype=float)[mask]
+    y_pred = np.asarray(y_pred, dtype=float)[mask]
+
+    if len(y_true) == 0:
+        return {}
+
+    e = y_pred - y_true
+    ae = np.abs(e)
+    se = e ** 2
+
+    nonzero = np.abs(y_true) > 1e-12
+    pct = np.full(len(y_true), np.nan, dtype=float)
+    pct[nonzero] = 100.0 * e[nonzero] / y_true[nonzero]
+
+    ss_res = float(np.sum(se))
+    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+    r2 = float("nan") if ss_tot == 0 else 1.0 - ss_res / ss_tot
+
+    return {
+        "N": int(len(y_true)),
+        "ME": float(np.mean(e)),
+        "MAE": float(np.mean(ae)),
+        "MSE": float(np.mean(se)),
+        "RMSE": float(np.sqrt(np.mean(se))),
+        "MedAE": float(np.median(ae)),
+        "MPE_pct": float(np.nanmean(pct)) if np.any(nonzero) else float("nan"),
+        "MAPE_pct": float(np.nanmean(np.abs(pct))) if np.any(nonzero) else float("nan"),
+        "RMSPE_pct": (
+            float(np.sqrt(np.nanmean(pct ** 2)))
+            if np.any(nonzero) else float("nan")
+        ),
+        "R2": r2,
+        "Pearson": safe_corr(y_true, y_pred, "pearson"),
+        "Spearman": safe_corr(y_true, y_pred, "spearman"),
+        "Bias": float(np.mean(e)),
+    }
+
+
+def _prediction_pairs(df: pd.DataFrame) -> List[Tuple[str, str, str]]:
+    """
+    Detect target/observed/predicted column triplets across common naming schemes.
+    """
+    cols = list(df.columns)
+    lower = {c.lower(): c for c in cols}
+    pairs = []
+
+    # Long format.
+    target_col = next(
+        (lower[x] for x in ("target", "parameter") if x in lower),
+        None,
+    )
+    true_col = next(
+        (lower[x] for x in ("y_true", "true", "observed", "actual") if x in lower),
+        None,
+    )
+    pred_col = next(
+        (lower[x] for x in ("y_pred", "pred", "predicted", "prediction") if x in lower),
+        None,
+    )
+
+    if target_col and true_col and pred_col:
+        # Handled specially by caller.
+        return [("__LONG__", true_col, pred_col)]
+
+    patterns = [
+        ("true_", "pred_"),
+        ("true_", "predicted_"),
+        ("true_", "prediction_"),
+        ("observed_", "pred_"),
+        ("observed_", "predicted_"),
+        ("actual_", "pred_"),
+        ("actual_", "predicted_"),
+        ("y_true_", "y_pred_"),
+    ]
+
+    for true_prefix, pred_prefix in patterns:
+        for c in cols:
+            lc = c.lower()
+            if lc.startswith(true_prefix):
+                suffix = lc[len(true_prefix):]
+                p = lower.get(pred_prefix + suffix)
+                if p:
+                    pairs.append((suffix, c, p))
+
+    suffix_patterns = [
+        ("_true", "_pred"),
+        ("_true", "_predicted"),
+        ("_observed", "_pred"),
+        ("_observed", "_predicted"),
+        ("_actual", "_pred"),
+        ("_actual", "_predicted"),
+    ]
+
+    for true_suffix, pred_suffix in suffix_patterns:
+        for c in cols:
+            lc = c.lower()
+            if lc.endswith(true_suffix):
+                base = lc[:-len(true_suffix)]
+                p = lower.get(base + pred_suffix)
+                if p:
+                    pairs.append((base, c, p))
+
+    # Common wide format: truth column is exactly "R_nought" and
+    # prediction column is "pred_R_nought" / "predicted_R_nought".
+    for c in cols:
+        lc = c.lower()
+        if lc.startswith(("pred_", "predicted_", "prediction_")):
+            for prefix in ("pred_", "predicted_", "prediction_"):
+                if lc.startswith(prefix):
+                    suffix = lc[len(prefix):]
+                    truth = lower.get(suffix)
+                    if truth:
+                        pairs.append((suffix, truth, c))
+                    break
+
+    # De-duplicate.
+    unique = []
+    seen = set()
+    for item in pairs:
+        key = (item[1], item[2])
+        if key not in seen:
+            unique.append(item)
+            seen.add(key)
+    return unique
+
+
+def make_extended_metrics(predictions_csv: Path, output_csv: Path) -> pd.DataFrame:
+    if not predictions_csv.is_file():
+        return pd.DataFrame()
+
+    df = pd.read_csv(predictions_csv)
+    pairs = _prediction_pairs(df)
+    rows = []
+
+    if pairs and pairs[0][0] == "__LONG__":
+        lower = {c.lower(): c for c in df.columns}
+        target_col = next(lower[x] for x in ("target", "parameter") if x in lower)
+        true_col = pairs[0][1]
+        pred_col = pairs[0][2]
+
+        for target, sub in df.groupby(target_col):
+            m = regression_metrics(
+                sub[true_col].to_numpy(float),
+                sub[pred_col].to_numpy(float),
+            )
+            if m:
+                rows.append({"Target": str(target), **m})
+    else:
+        for target, true_col, pred_col in pairs:
+            try:
+                m = regression_metrics(
+                    pd.to_numeric(df[true_col], errors="coerce").to_numpy(float),
+                    pd.to_numeric(df[pred_col], errors="coerce").to_numpy(float),
+                )
+            except Exception:
+                continue
+            if m:
+                rows.append(
+                    {
+                        "Target": target,
+                        "TrueColumn": true_col,
+                        "PredColumn": pred_col,
+                        **m,
+                    }
+                )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        out.to_csv(output_csv, index=False)
+    return out
+
+
+def find_run_file(run_dir: Path, name: str) -> Optional[Path]:
+    direct = run_dir / name
+    if direct.is_file():
+        return direct
+    found = sorted(
+        run_dir.rglob(name),
+        key=lambda p: p.stat().st_mtime,
+    )
+    return found[-1] if found else None
+
+
+def split_information(run_dir: Path) -> Dict:
+    split = find_run_file(run_dir, "split_indices.npz")
+    if split is None:
+        return {}
+
+    info = {
+        "split_file": str(split),
+        "split_file_sha256": sha256(split),
+    }
+
+    try:
+        z = np.load(split)
+        counts = {}
+        canonical = hashlib.sha256()
+        for key in sorted(z.files):
+            arr = np.asarray(z[key])
+            canonical.update(key.encode("utf-8"))
+            canonical.update(str(arr.dtype).encode("utf-8"))
+            canonical.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+            canonical.update(np.ascontiguousarray(arr).tobytes())
+            if arr.ndim == 1 and np.issubdtype(arr.dtype, np.integer):
+                counts[key] = int(len(arr))
+        info["split_content_sha256"] = canonical.hexdigest()
+        info["split_counts"] = counts
+
+        # Flexible train/validation/test percentages.
+        train_n = next((v for k, v in counts.items() if "train" in k.lower()), None)
+        val_n = next(
+            (v for k, v in counts.items() if "val" in k.lower()), None
+        )
+        test_n = next((v for k, v in counts.items() if "test" in k.lower()), None)
+
+        if train_n is not None and val_n is not None and test_n is not None:
+            total = train_n + val_n + test_n
+            info["split_percent"] = {
+                "train": 100.0 * train_n / total,
+                "validation": 100.0 * val_n / total,
+                "test": 100.0 * test_n / total,
+            }
+    except Exception as e:
+        info["split_read_error"] = str(e)
+
+    return info
+
+
+def validated_task_result(task: Dict) -> Tuple[bool, str]:
+    """
+    A task is complete only when a successful DONE record and real output
+    files are present and readable.
+    """
+    marker = done_marker(task)
+
+    if not marker.is_file():
+        return False, "DONE marker missing"
+
+    try:
+        metadata = json.loads(
+            marker.read_text()
+        )
+    except Exception as exc:
+        return False, f"DONE marker unreadable: {exc}"
+
+    if metadata.get("status") != "SUCCESS":
+        return False, f"status={metadata.get('status')!r}"
+
+    metrics_raw = (
+        metadata.get("stable_package_metrics")
+        or metadata.get("metrics_csv")
+    )
+
+    predictions_raw = metadata.get(
+        "predictions_csv"
+    )
+
+    if not metrics_raw:
+        return False, "metrics path missing"
+
+    if not predictions_raw:
+        return False, "predictions path missing"
+
+    metrics = Path(metrics_raw)
+    predictions = Path(predictions_raw)
+
+    if not metrics.is_file() or metrics.stat().st_size == 0:
+        return False, f"metrics missing/empty: {metrics}"
+
+    if not predictions.is_file() or predictions.stat().st_size == 0:
+        return False, f"predictions missing/empty: {predictions}"
+
+    try:
+        metrics_df = pd.read_csv(metrics)
+        predictions_df = pd.read_csv(predictions)
+    except Exception as exc:
+        return False, f"result CSV unreadable: {exc}"
+
+    if metrics_df.empty:
+        return False, "metrics CSV empty"
+
+    if predictions_df.empty:
+        return False, "predictions CSV empty"
+
+    return True, "validated SUCCESS"
+
+
+# =============================================================================
+# WORKER
+# =============================================================================
+
+def worker(task_id: int) -> None:
+    ensure_project_layout()
+    task = get_task(task_id)
+
+    done = done_marker(task)
+    failed = failed_marker(task)
+    done.parent.mkdir(parents=True, exist_ok=True)
+    failed.parent.mkdir(parents=True, exist_ok=True)
+    task_result_root(task).mkdir(parents=True, exist_ok=True)
+
+    complete, reason = validated_task_result(task)
+
+    if complete:
+        print(
+            "[SKIP] validated completed result:",
+            task,
+            flush=True,
+        )
+        return
+
+    # A stale/invalid DONE marker must not block a targeted rerun.
+    if done.exists():
+        archive = STATE / "invalid_done_markers"
+        archive.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        target = archive / done.name
+
+        if target.exists():
+            target = archive / (
+                done.stem
+                + "_"
+                + datetime.now().strftime("%Y%m%d_%H%M%S")
+                + done.suffix
+            )
+
+        shutil.move(
+            str(done),
+            str(target),
+        )
+
+        print(
+            "[RERUN] archived invalid DONE marker:",
+            target,
+            "| reason:",
+            reason,
+            flush=True,
+        )
+
+    if failed.exists():
+        failed.unlink()
+
+    metadata = {
+        **task,
+        "experiment": "Experiment1_LimitedTest",
+        "started": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+        "seed": SEED,
+        "execution_family": (
+            "AUTHOR_PHYLOCNN"
+            if task["model"] in AUTHOR_MODELS
+            else "PHYLOGNN"
+        ),
+        "python_executable": sys.executable,
+        "python_version": sys.version,
+        "conda_prefix": os.environ.get("CONDA_PREFIX"),
+    }
+
+    try:
+        print("=" * 120)
+        print("STEP 3 — EXPERIMENT 1 WORKER")
+        print("=" * 120)
+        print("Task    :", task_id)
+        print("Dataset :", task["dataset"])
+        print("Model   :", task["model"])
+        print("Seed    :", SEED)
+
+        if task["model"] in AUTHOR_MODELS:
+            variant = AUTHOR_VARIANT[task["model"]]
+            notebook = author_notebook(task["dataset"])
+            author_json = find_author_json(
+                task["dataset"],
+                variant,
+            )
+
+            print("AUTHOR PHYLOCNN")
+
+            print(
+                "Notebook      :",
+                notebook,
+                "(provenance only; NOT executed)",
+            )
+
+            print(
+                "Architecture  :",
+                author_json,
+                "(SOURCE OF TRUTH)",
+            )
+            print("Released H5   : NOT LOADED")
+            print("Training      : FROM SCRATCH")
+
+            metadata["author_notebook"] = str(notebook)
+            metadata["author_json"] = str(author_json)
+            metadata["author_json_sha256"] = sha256(author_json)
+            metadata["released_h5_loaded"] = False
+
+        run_dir = run_training(task)
+        metadata["run_dir"] = str(run_dir)
+
+        metrics_csv = find_run_file(run_dir, "metrics.csv")
+        predictions_csv = find_run_file(run_dir, "predictions.csv")
+        history_csv = find_run_file(run_dir, "training_history.csv")
+
+        if metrics_csv is None:
+            raise RuntimeError("Training reported SUCCESS but metrics.csv is missing")
+        if predictions_csv is None:
+            raise RuntimeError("Training reported SUCCESS but predictions.csv is missing")
+
+        metadata["metrics_csv"] = str(metrics_csv)
+        metadata["predictions_csv"] = str(predictions_csv)
+        metadata["training_history_csv"] = str(history_csv) if history_csv else None
+
+        # Copy package metrics into a stable task-level location.
+        stable_package_metrics = task_result_root(task) / "PACKAGE_METRICS.csv"
+        shutil.copy2(metrics_csv, stable_package_metrics)
+        metadata["stable_package_metrics"] = str(stable_package_metrics)
+
+        # Add ME/MPE/etc. whenever true/prediction columns can be detected.
+        extended_csv = task_result_root(task) / "EXTENDED_METRICS.csv"
+        extended = make_extended_metrics(predictions_csv, extended_csv)
+        if not extended.empty:
+            metadata["extended_metrics_csv"] = str(extended_csv)
+        else:
+            metadata["extended_metrics_csv"] = None
+            metadata["extended_metrics_note"] = (
+                "Prediction column schema was not automatically paired; "
+                "PACKAGE_METRICS.csv remains authoritative."
+            )
+
+        metadata.update(split_information(run_dir))
+
+        metadata["status"] = "SUCCESS"
+        metadata["finished"] = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+        done.write_text(json.dumps(metadata, indent=2) + "\n")
+
+        print()
+        print("=" * 120)
+        print("SUCCESS")
+        print("=" * 120)
+        print("Run directory :", run_dir)
+        print("Metrics       :", stable_package_metrics)
+        if not extended.empty:
+            print("Extended      :", extended_csv)
+            print()
+            print(extended.to_string(index=False))
+        else:
+            print()
+            print(pd.read_csv(stable_package_metrics).to_string(index=False))
+
+    except Exception as e:
+        metadata["status"] = "FAILED"
+        metadata["failed"] = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+        metadata["exception_type"] = type(e).__name__
+        metadata["exception"] = str(e)
+        metadata["traceback"] = traceback.format_exc()
+        failed.write_text(json.dumps(metadata, indent=2) + "\n")
+
+        print(json.dumps(metadata, indent=2))
+        raise
+
+
+# =============================================================================
+# PREFLIGHT
+# =============================================================================
+
+def shell(cmd: Sequence[str], cwd: Optional[Path] = None) -> None:
+    print("[CMD]", " ".join(shlex.quote(str(x)) for x in cmd), flush=True)
+    subprocess.run(
+        [str(x) for x in cmd],
+        cwd=str(cwd) if cwd else None,
+        env=runtime_env(),
+        check=True,
+    )
+
+
+def preflight(workers: int = 8) -> None:
+    ensure_project_layout()
+    write_task_map()
+
+    print("=" * 120)
+    print("STEP 3 PREFLIGHT")
+    print("=" * 120)
+
+    # ================================================================
+    # AUTHOR PHYLOCNN ARCHITECTURES
+    #
+    # The JSON files are the SOURCE OF TRUTH.
+    # The notebooks are NOT executed.
+    # ================================================================
+
+    from tensorflow import keras
+
+    for dataset in DATASETS:
+
+        notebook = author_notebook(dataset)
+
+        # Notebook is provenance only.
+        if notebook.is_file():
+            try:
+                verify_author_notebook_contains_original_model(dataset)
+
+                print(
+                    "[PASS] author notebook provenance:",
+                    notebook,
+                )
+
+            except Exception as exc:
+
+                print(
+                    "[WARN] notebook audit:",
+                    exc,
+                )
+
+        # Actual models come from released JSON.
+        for model in AUTHOR_MODELS:
+
+            variant = AUTHOR_VARIANT[model]
+
+            architecture_json = find_author_json(
+                dataset,
+                variant,
+            )
+
+            # Make sure Keras can deserialize it.
+            tmp_model = load_legacy_keras2_sequential_json(
+                architecture_json
+            )
+
+            del tmp_model
+
+            print(
+                f"[PASS] AUTHOR JSON architecture "
+                f"{dataset:14s} "
+                f"{variant:9s}: "
+                f"{architecture_json}"
+            )
+
+    # ================================================================
+    # EXPERIMENT-SPECIFIC ENVIRONMENT CHECK
+    #
+    # DO NOT run `phylognn doctor` here.
+    #
+    # That command checks unrelated project-wide requirements such as:
+    #   - availability of the full original training simulations
+    #   - preferred Python version
+    #   - GPU availability on the current/login node
+    #
+    # Experiment 1 only requires:
+    #   - authors' released JSON architectures
+    #   - shipped datasets
+    #   - local PhyloGNN source
+    #   - Step2 architectures
+    # ================================================================
+
+    activate_repo_source()
+
+    required_imports = [
+        "tensorflow",
+        "keras",
+        "numpy",
+        "pandas",
+        "sklearn",
+        "ete3",
+        "spektral",
+        "phylognn",
+        "phylognn.config",
+        "phylognn.training",
+        "phylognn.models",
+    ]
+
+    for module_name in required_imports:
+        __import__(module_name)
+        print(f"[PASS] import: {module_name}")
+
+    print("[PASS] Python executable:", sys.executable)
+    print("[INFO] GPU is NOT required on the login node during preflight")
+
+    # Validate each shipped dataset and prepare caches BEFORE 44 workers race
+    # to construct the same encodings/graphs.
+    for dataset in DATASETS:
+        print()
+        print("=" * 120)
+        print("VALIDATE + CACHE:", dataset)
+        print("=" * 120)
+
+        shell(
+            phylognn_cli_command([
+                "inspect",
+                "--dataset", dataset,
+                "--parse-sample", "500",
+            ]),
+            cwd=SCRIPT_DIR,
+        )
+
+        shell(
+            phylognn_cli_command([
+                "prepare",
+                "--dataset", dataset,
+                "--feature-mode", FEATURE_MODE,
+                "--workers", str(workers),
+                "--phylocnn",
+            ]),
+            cwd=SCRIPT_DIR,
+        )
+
+    # Import Step2 inside the correct uv environment.
+    code = (
+        "import sys;"
+        f"sys.path.insert(0,{str(SCRIPT_DIR)!r});"
+        "import GNNArchitectures as s;"
+        "print('STEP2 ARCHITECTURES:', ','.join(s.OUR_ARCHITECTURES));"
+        "assert len(s.OUR_ARCHITECTURES)==8"
+    )
+    shell(
+        [sys.executable, "-c", code],
+        cwd=SCRIPT_DIR,
+    )
+
+    print()
+    print("=" * 120)
+    print("PREFLIGHT PASSED")
+    print("=" * 120)
+    print("Datasets       : 4")
+    print("Author models  : 3")
+    print("Our models     : 8")
+    print("Total jobs     : 44")
+    print("Cross-validation: NO")
+
+
+# =============================================================================
+# PLAN / STATUS
+# =============================================================================
+
+def plan() -> None:
+    write_task_map()
+    print("=" * 120)
+    print("STEP 3 — EXPERIMENT 1 PLAN")
+    print("=" * 120)
+    print("4 datasets x 11 models = 44 jobs")
+    print("One fixed split; no cross-validation.")
+    print()
+    print(f"{'ID':>3}  {'DATASET':16s}  {'MODEL':30s}  FAMILY")
+    print("-" * 90)
+    for task in all_tasks():
+        family = "AUTHOR" if task["model"] in AUTHOR_MODELS else "OURS"
+        print(
+            f"{task['task_id']:3d}  {task['dataset']:16s}  "
+            f"{task['model']:30s}  {family}"
+        )
+
+
+def _metric_table_from_done(records: List[Dict]) -> pd.DataFrame:
+    frames = []
+
+    for rec in records:
+        ext_path = rec.get("extended_metrics_csv")
+        pkg_path = rec.get("stable_package_metrics") or rec.get("metrics_csv")
+
+        if ext_path and Path(ext_path).is_file():
+            df = pd.read_csv(ext_path)
+            df.insert(0, "Model", rec["model"])
+            df.insert(0, "Dataset", rec["dataset"])
+            df.insert(0, "TaskID", rec["task_id"])
+            frames.append(df)
+            continue
+
+        if pkg_path and Path(pkg_path).is_file():
+            df = pd.read_csv(pkg_path)
+            df.insert(0, "Model", rec["model"])
+            df.insert(0, "Dataset", rec["dataset"])
+            df.insert(0, "TaskID", rec["task_id"])
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def _format_metric_table(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "No completed metrics yet."
+
+    # Prefer the requested regression metrics while retaining target information.
+    preferred = [
+        "TaskID", "Dataset", "Model", "Target",
+        "N", "ME", "MAE", "MSE", "RMSE", "MedAE",
+        "MPE_pct", "MAPE_pct", "RMSPE_pct",
+        "R2", "Pearson", "Spearman", "Bias",
+    ]
+
+    cols = [c for c in preferred if c in df.columns]
+
+    # If extended metrics were unavailable, show all package metric columns.
+    if len(cols) <= 3:
+        cols = list(df.columns)
+
+    out = df[cols].copy()
+
+    for c in out.columns:
+        if pd.api.types.is_numeric_dtype(out[c]):
+            out[c] = out[c].map(
+                lambda x: f"{x:.5g}" if pd.notna(x) else "NA"
+            )
+
+    return out.to_string(index=False)
+
+
+def _safe_float(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _fmt_number(value, digits=4):
+    if value is None:
+        return "-"
+    try:
+        value = float(value)
+    except Exception:
+        return str(value)
+
+    if not math.isfinite(value):
+        return "-"
+
+    if abs(value) >= 1000:
+        return f"{value:.2e}"
+
+    return f"{value:.{digits}f}"
+
+
+def _fmt_seconds(seconds):
+    if seconds is None:
+        return "-"
+
+    try:
+        seconds = float(seconds)
+    except Exception:
+        return "-"
+
+    if not math.isfinite(seconds):
+        return "-"
+
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+
+    minutes = seconds / 60.0
+
+    if minutes < 60:
+        return f"{minutes:.1f}m"
+
+    hours = minutes / 60.0
+
+    return f"{hours:.2f}h"
+
+
+def _slurm_task_status():
+    """
+    Current Slurm state indexed by array task ID.
+
+    IMPORTANT:
+    Read ONLY the most recently submitted Step-3 array.
+
+    `squeue -r` expands an array into individual tasks, avoiding the
+    compressed-array-ID problem where entries such as 0-43 cannot be parsed
+    as integer task IDs.
+    """
+
+    info = {}
+
+    submission_file = (
+        STATE
+        / "last_submission.json"
+    )
+
+    if not submission_file.is_file():
+        return info
+
+    try:
+
+        submission = json.loads(
+            submission_file.read_text()
+        )
+
+        job_id = str(
+            submission["job_id"]
+        )
+
+    except Exception:
+        return info
+
+    try:
+
+        result = subprocess.run(
+            [
+                "squeue",
+                "-r",
+                "-h",
+                "-j",
+                job_id,
+                "-o",
+                "%A|%a|%T|%M|%N",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+
+    except Exception:
+        return info
+
+    for line in result.stdout.splitlines():
+
+        fields = line.strip().split(
+            "|"
+        )
+
+        if len(fields) != 5:
+            continue
+
+        master_id = fields[0]
+        array_id = fields[1]
+        state = fields[2]
+        elapsed = fields[3]
+        node = fields[4]
+
+        try:
+            task_id = int(
+                array_id
+            )
+
+        except Exception:
+            continue
+
+        info[
+            task_id
+        ] = {
+            "job_id":
+                master_id,
+
+            "state":
+                state.upper(),
+
+            "elapsed":
+                elapsed,
+
+            "node":
+                node,
+        }
+
+    return info
+
+
+def _latest_task_log(task_id, slurm_info=None):
+    """
+    Find the newest stdout log for one array task.
+
+    Prefer the current active Slurm job ID so old logs from an earlier
+    submission cannot contaminate the live dashboard.
+    """
+
+    if not LOGS.exists():
+        return None
+
+    candidates = []
+
+    if slurm_info:
+        job_id = slurm_info.get("job_id")
+
+        if job_id:
+            candidates.extend(
+                LOGS.glob(
+                    f"*.{job_id}_{task_id}.out"
+                )
+            )
+
+    if not candidates:
+
+        submission_file = (
+            STATE
+            / "last_submission.json"
+        )
+
+        if submission_file.is_file():
+
+            try:
+
+                submission = json.loads(
+                    submission_file.read_text()
+                )
+
+                current_job = str(
+                    submission[
+                        "job_id"
+                    ]
+                )
+
+                candidates.extend(
+                    LOGS.glob(
+                        f"*.{current_job}_{task_id}.out"
+                    )
+                )
+
+            except Exception:
+                pass
+
+    # We intentionally DO NOT fall back to arbitrary old array logs here.
+    # Otherwise an old failed/completed task can contaminate a fresh run.
+
+    candidates = [
+        x for x in candidates
+        if x.is_file()
+    ]
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda x: x.stat().st_mtime,
+    )
+
+
+def _read_log_tail(path, max_bytes=2_000_000):
+
+    if path is None:
+        return ""
+
+    try:
+        size = path.stat().st_size
+
+        with path.open(
+            "rb"
+        ) as handle:
+
+            if size > max_bytes:
+                handle.seek(
+                    size - max_bytes
+                )
+
+            raw = handle.read()
+
+        text = raw.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        # Remove ANSI colour/control sequences.
+        text = re.sub(
+            r"\x1b\[[0-9;]*[A-Za-z]",
+            "",
+            text,
+        )
+
+        return text
+
+    except Exception:
+        return ""
+
+
+def _parse_elapsed_seconds(value):
+    """
+    Convert Slurm elapsed strings such as:
+        21:43
+        01:21:43
+        1-02:03:04
+    into seconds.
+    """
+
+    if not value:
+        return None
+
+    try:
+
+        days = 0
+
+        if "-" in value:
+            day_text, value = value.split(
+                "-",
+                1,
+            )
+            days = int(day_text)
+
+        pieces = [
+            int(x)
+            for x in value.split(":")
+        ]
+
+        if len(pieces) == 2:
+            hours = 0
+            minutes, seconds = pieces
+
+        elif len(pieces) == 3:
+            hours, minutes, seconds = pieces
+
+        else:
+            return None
+
+        return (
+            days * 86400
+            +
+            hours * 3600
+            +
+            minutes * 60
+            +
+            seconds
+        )
+
+    except Exception:
+        return None
+
+
+def _parse_training_log(text):
+    """
+    Parse the epoch lines emitted by the common PhyloGNN trainer.
+
+    Example:
+        Epoch  12/1000
+        train loss 14.22
+        validation loss 15.91
+        mae 0.41/0.46
+        best epoch 11
+    """
+
+    info = {
+        "epoch": None,
+        "total_epochs": None,
+        "train_loss": None,
+        "val_loss": None,
+        "metric_name": None,
+        "train_metric": None,
+        "val_metric": None,
+        "best_epoch": None,
+        "mean_sec_epoch": None,
+        "train_seconds": None,
+        "final_metric_name": None,
+        "final_metric": None,
+    }
+
+    if not text:
+        return info
+
+    epoch_pattern = re.compile(
+        r"""
+        \[
+        (?P<timestamp>\d{2}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})
+        \]
+        .*?
+        Epoch\s+
+        (?P<epoch>\d+)
+        /
+        (?P<total>\d+)
+        \s+
+        train\s+loss\s+
+        (?P<train_loss>[-+0-9.eE]+)
+        \s+
+        validation\s+loss\s+
+        (?P<val_loss>[-+0-9.eE]+)
+        \s+
+        (?P<metric>[A-Za-z0-9_%.-]+)
+        \s+
+        (?P<train_metric>[-+0-9.eE]+)
+        /
+        (?P<val_metric>[-+0-9.eE]+)
+        \s+
+        best\s+epoch\s+
+        (?P<best_epoch>\d+)
+        """,
+        re.VERBOSE,
+    )
+
+    matches = list(
+        epoch_pattern.finditer(
+            text
+        )
+    )
+
+    if matches:
+
+        last = matches[-1]
+
+        info["epoch"] = int(
+            last.group("epoch")
+        )
+
+        info["total_epochs"] = int(
+            last.group("total")
+        )
+
+        info["train_loss"] = _safe_float(
+            last.group("train_loss")
+        )
+
+        info["val_loss"] = _safe_float(
+            last.group("val_loss")
+        )
+
+        info["metric_name"] = (
+            last.group("metric")
+        )
+
+        info["train_metric"] = _safe_float(
+            last.group("train_metric")
+        )
+
+        info["val_metric"] = _safe_float(
+            last.group("val_metric")
+        )
+
+        info["best_epoch"] = int(
+            last.group("best_epoch")
+        )
+
+        # -------------------------------------------------------------
+        # Mean time per epoch from epoch timestamps.
+        # -------------------------------------------------------------
+
+        timestamps = []
+
+        for match in matches:
+
+            try:
+
+                timestamp = datetime.strptime(
+                    match.group("timestamp"),
+                    "%m/%d/%y %H:%M:%S",
+                )
+
+                timestamps.append(
+                    (
+                        int(
+                            match.group("epoch")
+                        ),
+                        timestamp,
+                    )
+                )
+
+            except Exception:
+                pass
+
+        if len(timestamps) >= 2:
+
+            first_epoch, first_time = timestamps[0]
+            last_epoch, last_time = timestamps[-1]
+
+            epoch_difference = (
+                last_epoch
+                -
+                first_epoch
+            )
+
+            if epoch_difference > 0:
+
+                seconds = (
+                    last_time
+                    -
+                    first_time
+                ).total_seconds()
+
+                info["mean_sec_epoch"] = (
+                    seconds
+                    /
+                    epoch_difference
+                )
+
+    # -----------------------------------------------------------------
+    # Parse final trainer summary if training has finished.
+    # -----------------------------------------------------------------
+
+    done_pattern = re.compile(
+        r"""
+        done:
+        \s*
+        (?P<metric>[A-Za-z0-9_%.-]+)
+        \s*=\s*
+        (?P<value>[-+0-9.eE]+)
+        \s*
+        \(
+        train\s+
+        (?P<seconds>[-+0-9.eE]+)
+        s,
+        \s*
+        best\s+epoch\s+
+        (?P<best_epoch>\d+)
+        \)
+        """,
+        re.VERBOSE,
+    )
+
+    done_matches = list(
+        done_pattern.finditer(
+            text
+        )
+    )
+
+    if done_matches:
+
+        match = done_matches[-1]
+
+        info["final_metric_name"] = (
+            match.group("metric")
+        )
+
+        info["final_metric"] = _safe_float(
+            match.group("value")
+        )
+
+        info["train_seconds"] = _safe_float(
+            match.group("seconds")
+        )
+
+        info["best_epoch"] = int(
+            match.group("best_epoch")
+        )
+
+        if (
+            info["train_seconds"] is not None
+            and
+            info["epoch"]
+        ):
+
+            info["mean_sec_epoch"] = (
+                info["train_seconds"]
+                /
+                info["epoch"]
+            )
+
+    return info
+
+
+def _task_dashboard_record(
+    task,
+    slurm_map,
+):
+    """
+    Build one live status record.
+    """
+
+    task_id = task["task_id"]
+
+    slurm = slurm_map.get(
+        task_id,
+        {}
+    )
+
+    done = done_marker(
+        task
+    ).is_file()
+
+    failed = failed_marker(
+        task
+    ).is_file()
+
+    active_state = slurm.get(
+        "state"
+    )
+
+    if done:
+        state = "DONE"
+
+    elif active_state:
+        state = active_state
+
+    elif failed:
+        state = "FAILED"
+
+    else:
+        state = "WAIT"
+
+    log_file = _latest_task_log(
+        task_id,
+        slurm,
+    )
+
+    log_text = _read_log_tail(
+        log_file
+    )
+
+    training = _parse_training_log(
+        log_text
+    )
+
+    epoch = training[
+        "epoch"
+    ]
+
+    total_epochs = training[
+        "total_epochs"
+    ]
+
+    progress = None
+
+    if (
+        epoch is not None
+        and
+        total_epochs
+    ):
+
+        progress = (
+            100.0
+            *
+            epoch
+            /
+            total_epochs
+        )
+
+    mean_sec_epoch = training[
+        "mean_sec_epoch"
+    ]
+
+    eta_seconds = None
+
+    if (
+        mean_sec_epoch is not None
+        and
+        epoch is not None
+        and
+        total_epochs is not None
+        and
+        total_epochs >= epoch
+    ):
+
+        eta_seconds = (
+            total_epochs
+            -
+            epoch
+        ) * mean_sec_epoch
+
+    return {
+        "task_id":
+            task_id,
+
+        "dataset":
+            task["dataset"],
+
+        "model":
+            task["model"],
+
+        "state":
+            state,
+
+        "epoch":
+            epoch,
+
+        "total_epochs":
+            total_epochs,
+
+        "progress":
+            progress,
+
+        "train_loss":
+            training["train_loss"],
+
+        "val_loss":
+            training["val_loss"],
+
+        "metric_name":
+            training["metric_name"],
+
+        "train_metric":
+            training["train_metric"],
+
+        "val_metric":
+            training["val_metric"],
+
+        "best_epoch":
+            training["best_epoch"],
+
+        "elapsed":
+            slurm.get(
+                "elapsed",
+                "-"
+            ),
+
+        "elapsed_seconds":
+            _parse_elapsed_seconds(
+                slurm.get(
+                    "elapsed"
+                )
+            ),
+
+        "mean_sec_epoch":
+            mean_sec_epoch,
+
+        "eta_seconds":
+            eta_seconds,
+
+        "final_metric_name":
+            training["final_metric_name"],
+
+        "final_metric":
+            training["final_metric"],
+
+        "log":
+            str(log_file)
+            if log_file
+            else None,
+    }
+
+
+def _short_model_name(name):
+
+    aliases = {
+        "author_phylocnn_2gen":
+            "PhyloCNN-2G",
+
+        "author_phylocnn_1gen":
+            "PhyloCNN-1G",
+
+        "author_phylocnn_nocontext":
+            "PhyloCNN-NC",
+
+        "graphsage":
+            "GraphSAGE",
+
+        "gat":
+            "GAT",
+
+        "gcn":
+            "GCN",
+
+        "gin":
+            "GIN",
+
+        "ecc":
+            "ECC",
+
+        "trignn":
+            "TriGNN",
+
+        "gnn_fusion":
+            "GNN-Fusion",
+
+        "graphsage_gat_fusion":
+            "SAGE-GAT",
+    }
+
+    return aliases.get(
+        name,
+        name,
+    )
+
+
+def _status_once():
+
+    ensure_project_layout()
+    write_task_map()
+
+    slurm_map = _slurm_task_status()
+
+    rows = [
+        _task_dashboard_record(
+            task,
+            slurm_map,
+        )
+        for task in all_tasks()
+    ]
+
+    completed_records = []
+
+    for task in all_tasks():
+
+        marker = done_marker(
+            task
+        )
+
+        if marker.is_file():
+
+            try:
+                completed_records.append(
+                    json.loads(
+                        marker.read_text()
+                    )
+                )
+            except Exception:
+                pass
+
+    # =====================================================================
+    # OVERALL SUMMARY
+    # =====================================================================
+
+    states = {}
+
+    for row in rows:
+
+        state = row["state"]
+
+        states[state] = (
+            states.get(
+                state,
+                0,
+            )
+            +
+            1
+        )
+
+    n_done = sum(
+        row["state"] == "DONE"
+        for row in rows
+    )
+
+    n_failed = sum(
+        row["state"] == "FAILED"
+        for row in rows
+    )
+
+    n_running = sum(
+        row["state"] == "RUNNING"
+        for row in rows
+    )
+
+    n_pending = sum(
+        row["state"] in {
+            "PENDING",
+            "CONFIGURING",
+        }
+        for row in rows
+    )
+
+    print(
+        "=" * 190
+    )
+
+    print(
+        "PHYLOGNN EXPERIMENT 1 — LIVE TRAINING DASHBOARD"
+    )
+
+    print(
+        "=" * 190
+    )
+
+    print(
+        f"Completed: {n_done:2d}/44   "
+        f"Running: {n_running:2d}   "
+        f"Pending: {n_pending:2d}   "
+        f"Failed: {n_failed:2d}"
+    )
+
+    if states:
+        print(
+            "States:",
+            states,
+        )
+
+    print(
+        "NOTE: This is a REGRESSION experiment. "
+        "Classification accuracy is therefore N/A. "
+        "Live optimisation metric shown below is normally MAE."
+    )
+
+    print()
+
+    # =====================================================================
+    # LIVE PER-TASK TABLE
+    # =====================================================================
+
+    header = (
+        f"{'ID':>2} "
+        f"{'DATASET':13} "
+        f"{'MODEL':13} "
+        f"{'STATE':11} "
+        f"{'EPOCH':11} "
+        f"{'PROG':>6} "
+        f"{'TRAIN LOSS':>11} "
+        f"{'VAL LOSS':>11} "
+        f"{'TRAIN MET':>10} "
+        f"{'VAL MET':>10} "
+        f"{'BEST':>5} "
+        f"{'ELAPSED':>9} "
+        f"{'SEC/EP':>9} "
+        f"{'ETA':>9} "
+        f"{'FINAL':>12}"
+    )
+
+    print(
+        header
+    )
+
+    print(
+        "-" * len(header)
+    )
+
+    for row in rows:
+
+        if (
+            row["epoch"] is not None
+            and
+            row["total_epochs"] is not None
+        ):
+
+            epoch_text = (
+                f"{row['epoch']}/"
+                f"{row['total_epochs']}"
+            )
+
+        else:
+            epoch_text = "-"
+
+        progress_text = (
+            f"{row['progress']:5.1f}%"
+            if row["progress"] is not None
+            else "-"
+        )
+
+        metric_train = _fmt_number(
+            row["train_metric"]
+        )
+
+        metric_val = _fmt_number(
+            row["val_metric"]
+        )
+
+        best = (
+            str(
+                row["best_epoch"]
+            )
+            if row["best_epoch"] is not None
+            else "-"
+        )
+
+        sec_epoch = (
+            _fmt_seconds(
+                row["mean_sec_epoch"]
+            )
+        )
+
+        eta = _fmt_seconds(
+            row["eta_seconds"]
+        )
+
+        final_text = "-"
+
+        if (
+            row["final_metric_name"]
+            and
+            row["final_metric"] is not None
+        ):
+
+            final_text = (
+                f"{row['final_metric_name']}="
+                f"{_fmt_number(row['final_metric'])}"
+            )
+
+        print(
+            f"{row['task_id']:2d} "
+            f"{row['dataset'][:13]:13} "
+            f"{_short_model_name(row['model'])[:13]:13} "
+            f"{row['state'][:11]:11} "
+            f"{epoch_text:11} "
+            f"{progress_text:>6} "
+            f"{_fmt_number(row['train_loss']):>11} "
+            f"{_fmt_number(row['val_loss']):>11} "
+            f"{metric_train:>10} "
+            f"{metric_val:>10} "
+            f"{best:>5} "
+            f"{row['elapsed']:>9} "
+            f"{sec_epoch:>9} "
+            f"{eta:>9} "
+            f"{final_text:>12}"
+        )
+
+    # =====================================================================
+    # CURRENT MEANS
+    # =====================================================================
+
+    active_with_epochs = [
+        row
+        for row in rows
+        if (
+            row["state"] == "RUNNING"
+            and
+            row["epoch"] is not None
+        )
+    ]
+
+    print()
+    print(
+        "=" * 190
+    )
+
+    print(
+        "CURRENT MEANS ACROSS RUNNING MODELS"
+    )
+
+    print(
+        "=" * 190
+    )
+
+    def mean_available(
+        field
+    ):
+
+        values = [
+            row[field]
+            for row in active_with_epochs
+            if row.get(field) is not None
+        ]
+
+        if not values:
+            return None
+
+        return float(
+            np.mean(
+                values
+            )
+        )
+
+    mean_epoch = mean_available(
+        "epoch"
+    )
+
+    mean_train_loss = mean_available(
+        "train_loss"
+    )
+
+    mean_val_loss = mean_available(
+        "val_loss"
+    )
+
+    mean_train_metric = mean_available(
+        "train_metric"
+    )
+
+    mean_val_metric = mean_available(
+        "val_metric"
+    )
+
+    mean_sec_epoch = mean_available(
+        "mean_sec_epoch"
+    )
+
+    mean_progress = mean_available(
+        "progress"
+    )
+
+    print(
+        "Running models with epoch data :",
+        len(
+            active_with_epochs
+        ),
+    )
+
+    print(
+        "Mean current epoch             :",
+        _fmt_number(
+            mean_epoch,
+            1,
+        ),
+    )
+
+    print(
+        "Mean progress                  :",
+        (
+            f"{mean_progress:.1f}%"
+            if mean_progress is not None
+            else "-"
+        ),
+    )
+
+    print(
+        "Mean training loss             :",
+        _fmt_number(
+            mean_train_loss
+        ),
+    )
+
+    print(
+        "Mean validation loss           :",
+        _fmt_number(
+            mean_val_loss
+        ),
+    )
+
+    print(
+        "Mean training MAE/metric       :",
+        _fmt_number(
+            mean_train_metric
+        ),
+    )
+
+    print(
+        "Mean validation MAE/metric     :",
+        _fmt_number(
+            mean_val_metric
+        ),
+    )
+
+    print(
+        "Mean time per epoch            :",
+        _fmt_seconds(
+            mean_sec_epoch
+        ),
+    )
+
+    # =====================================================================
+    # DATASET SUMMARY
+    # =====================================================================
+
+    print()
+    print(
+        "=" * 190
+    )
+
+    print(
+        "DATASET PROGRESS"
+    )
+
+    print(
+        "=" * 190
+    )
+
+    for dataset in DATASETS:
+
+        subset = [
+            row
+            for row in rows
+            if row["dataset"] == dataset
+        ]
+
+        done = sum(
+            row["state"] == "DONE"
+            for row in subset
+        )
+
+        failed = sum(
+            row["state"] == "FAILED"
+            for row in subset
+        )
+
+        running = sum(
+            row["state"] == "RUNNING"
+            for row in subset
+        )
+
+        pending = sum(
+            row["state"] in {
+                "PENDING",
+                "CONFIGURING",
+            }
+            for row in subset
+        )
+
+        epoch_progress = [
+            row["progress"]
+            for row in subset
+            if row["progress"] is not None
+        ]
+
+        mean_dataset_progress = (
+            float(
+                np.mean(
+                    epoch_progress
+                )
+            )
+            if epoch_progress
+            else 0.0
+        )
+
+        width = 40
+
+        filled = int(
+            round(
+                width
+                *
+                mean_dataset_progress
+                /
+                100.0
+            )
+        )
+
+        filled = max(
+            0,
+            min(
+                width,
+                filled,
+            ),
+        )
+
+        bar = (
+            "#"
+            *
+            filled
+            +
+            "-"
+            *
+            (
+                width
+                -
+                filled
+            )
+        )
+
+        print(
+            f"{dataset:16} "
+            f"|{bar}| "
+            f"epoch-progress={mean_dataset_progress:6.1f}%  "
+            f"done={done:2d} "
+            f"run={running:2d} "
+            f"pend={pending:2d} "
+            f"fail={failed:2d}"
+        )
+
+    # =====================================================================
+    # SPLIT CONSISTENCY
+    # =====================================================================
+
+    print()
+    print(
+        "=" * 190
+    )
+
+    print(
+        "SPLIT CONSISTENCY"
+    )
+
+    print(
+        "=" * 190
+    )
+
+    for dataset in DATASETS:
+
+        subset = [
+            record
+            for record in completed_records
+            if record["dataset"] == dataset
+        ]
+
+        hashes = sorted(
+            set(
+                record.get(
+                    "split_content_sha256"
+                )
+                for record in subset
+                if record.get(
+                    "split_content_sha256"
+                )
+            )
+        )
+
+        if not subset:
+
+            print(
+                f"{dataset:16}: "
+                "no completed runs yet"
+            )
+
+            continue
+
+        if len(hashes) == 1:
+
+            counts = next(
+                (
+                    record.get(
+                        "split_counts"
+                    )
+                    for record in subset
+                    if record.get(
+                        "split_counts"
+                    )
+                ),
+                None,
+            )
+
+            print(
+                f"{dataset:16}: PASS — "
+                f"{hashes[0][:12]}... "
+                f"{counts}"
+            )
+
+        elif len(hashes) == 0:
+
+            print(
+                f"{dataset:16}: "
+                "split hash unavailable"
+            )
+
+        else:
+
+            print(
+                f"{dataset:16}: "
+                "*** SPLIT MISMATCH *** "
+                f"{len(hashes)} hashes"
+            )
+
+    # =====================================================================
+    # FINAL METRICS AVAILABLE SO FAR
+    # =====================================================================
+
+    print()
+    print(
+        "=" * 190
+    )
+
+    print(
+        "COMPLETED TEST-SET METRICS"
+    )
+
+    print(
+        "=" * 190
+    )
+
+    metric_df = _metric_table_from_done(
+        completed_records
+    )
+
+    print(
+        _format_metric_table(
+            metric_df
+        )
+    )
+
+    if (
+        not metric_df.empty
+        and
+        "MAE" in metric_df.columns
+    ):
+
+        print()
+        print(
+            "=" * 190
+        )
+
+        print(
+            "BEST MEAN MAE SO FAR PER DATASET"
+        )
+
+        print(
+            "=" * 190
+        )
+
+        temp = metric_df.copy()
+
+        temp["MAE"] = pd.to_numeric(
+            temp["MAE"],
+            errors="coerce",
+        )
+
+        summary = (
+            temp
+            .groupby(
+                [
+                    "Dataset",
+                    "Model",
+                ],
+                as_index=False,
+            )["MAE"]
+            .mean()
+            .dropna()
+            .sort_values(
+                [
+                    "Dataset",
+                    "MAE",
+                ]
+            )
+        )
+
+        if not summary.empty:
+
+            best = (
+                summary
+                .groupby(
+                    "Dataset",
+                    as_index=False,
+                )
+                .first()
+            )
+
+            print(
+                best.to_string(
+                    index=False
+                )
+            )
+
+    return rows
+
+
+def status() -> None:
+    _status_once()
+
+
+def watch_status(seconds=20):
+    """
+    Continuously refresh the live dashboard.
+
+    Stop with Ctrl+C.
+    """
+
+    seconds = max(
+        2,
+        int(seconds),
+    )
+
+    try:
+
+        while True:
+
+            # Clear terminal.
+            print(
+                "\033[2J\033[H",
+                end="",
+                flush=True,
+            )
+
+            print(
+                "Last refresh:",
+                datetime.now()
+                .astimezone()
+                .isoformat(
+                    timespec="seconds"
+                ),
+            )
+
+            print(
+                f"Refresh interval: {seconds}s   "
+                "Stop: Ctrl+C"
+            )
+
+            print()
+
+            rows = _status_once()
+
+            done = sum(
+                row["state"] == "DONE"
+                for row in rows
+            )
+
+            failed = sum(
+                row["state"] == "FAILED"
+                for row in rows
+            )
+
+            active = sum(
+                row["state"] in {
+                    "RUNNING",
+                    "PENDING",
+                    "CONFIGURING",
+                }
+                for row in rows
+            )
+
+            if done == len(
+                all_tasks()
+            ):
+
+                print()
+                print(
+                    "[COMPLETE] All 44 tasks finished."
+                )
+
+                break
+
+            if (
+                active == 0
+                and
+                done + failed
+                ==
+                len(
+                    all_tasks()
+                )
+            ):
+
+                print()
+                print(
+                    "[STOP] No active jobs remain."
+                )
+
+                break
+
+            time.sleep(
+                seconds
+            )
+
+    except KeyboardInterrupt:
+
+        print()
+        print(
+            "[STOP] Dashboard closed. "
+            "Training jobs continue running."
+        )
+
+
+# =============================================================================
+# AGGREGATE
+# =============================================================================
+
+def aggregate() -> None:
+    records = []
+    package_frames = []
+    extended_frames = []
+
+    for task in all_tasks():
+        marker = done_marker(task)
+        if not marker.is_file():
+            continue
+
+        rec = json.loads(marker.read_text())
+        records.append(rec)
+
+        pkg = rec.get("stable_package_metrics") or rec.get("metrics_csv")
+        if pkg and Path(pkg).is_file():
+            df = pd.read_csv(pkg)
+            df.insert(0, "Model", task["model"])
+            df.insert(0, "Dataset", task["dataset"])
+            df.insert(0, "TaskID", task["task_id"])
+            package_frames.append(df)
+
+        ext = rec.get("extended_metrics_csv")
+        if ext and Path(ext).is_file():
+            df = pd.read_csv(ext)
+            df.insert(0, "Model", task["model"])
+            df.insert(0, "Dataset", task["dataset"])
+            df.insert(0, "TaskID", task["task_id"])
+            extended_frames.append(df)
+
+    RESULTS.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(records).to_json(
+        RESULTS / "Experiment1_RunManifest.json",
+        orient="records",
+        indent=2,
+    )
+
+    if package_frames:
+        pd.concat(
+            package_frames,
+            ignore_index=True,
+            sort=False,
+        ).to_csv(
+            RESULTS / "Experiment1_AllPackageMetrics.csv",
+            index=False,
+        )
+
+    if extended_frames:
+        pd.concat(
+            extended_frames,
+            ignore_index=True,
+            sort=False,
+        ).to_csv(
+            RESULTS / "Experiment1_AllExtendedMetrics.csv",
+            index=False,
+        )
+
+    print("=" * 120)
+    print("AGGREGATION")
+    print("=" * 120)
+    print(f"Completed runs: {len(records)}/44")
+    print("Output folder :", RESULTS)
+    print("Manifest      :", RESULTS / "Experiment1_RunManifest.json")
+    if package_frames:
+        print("Package metrics:", RESULTS / "Experiment1_AllPackageMetrics.csv")
+    if extended_frames:
+        print("Extended metrics:", RESULTS / "Experiment1_AllExtendedMetrics.csv")
+
+
+# =============================================================================
+# SLURM
+# =============================================================================
+
+
+def reset_fresh_submission_state() -> None:
+    """
+    Reset ONLY execution-state files from previous Step-3 submissions.
+
+    KEEP:
+      - prepared graph caches
+      - PhyloCNN encoding caches
+      - historical timestamped training outputs
+
+    REMOVE:
+      - old done markers
+      - old failed markers
+      - old Slurm stdout/stderr logs
+      - previous task map/submission marker
+
+    This prevents an old successful/failed job from being counted as part
+    of a new 44-model experiment.
+    """
+
+    print()
+    print("=" * 120)
+    print("RESETTING STEP-3 EXECUTION STATE")
+    print("=" * 120)
+
+    for directory in (
+        STATE / "done",
+        STATE / "failed",
+        LOGS,
+    ):
+
+        if directory.exists():
+            shutil.rmtree(directory)
+
+        directory.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        print("[RESET]", directory)
+
+    for file_path in (
+        STATE / "last_submission.json",
+        TASK_MAP,
+    ):
+
+        if file_path.exists():
+            file_path.unlink()
+            print("[RESET]", file_path)
+
+    print("[KEEP] graph / PhyloCNN caches")
+    print("[KEEP] historical timestamped result directories")
+    print()
+
+
+def smoke_test_ecc() -> None:
+    """
+    Run ONE epoch of ECC on BD-shipped before submitting the full array.
+
+    Why:
+      ECC has previously failed on all four datasets.  A normal structural
+      preflight only proves the model can import/build; it does not prove that
+      a complete forward/backward/checkpoint cycle works.
+
+    Therefore a fresh submission must prove one complete ECC epoch first.
+    """
+
+    global EPOCHS
+    global PATIENCE
+    global BATCH_SIZE
+
+    task = get_task(7)
+
+    smoke_root = (
+        STATE
+        / "preflight_smoke"
+        / "ecc"
+    )
+
+    if smoke_root.exists():
+        shutil.rmtree(smoke_root)
+
+    smoke_root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    original_epochs = EPOCHS
+    original_patience = PATIENCE
+
+    # BATCH_SIZE may or may not exist depending on Step-3 version.
+    had_batch_size = "BATCH_SIZE" in globals()
+
+    if had_batch_size:
+        original_batch_size = BATCH_SIZE
+
+    original_task_result_root = globals()[
+        "task_result_root"
+    ]
+
+    try:
+
+        EPOCHS = 1
+        PATIENCE = 1
+
+        if had_batch_size:
+            BATCH_SIZE = min(
+                int(original_batch_size),
+                32,
+            )
+
+        # Isolate the smoke result completely from real Experiment-1 outputs.
+        globals()["task_result_root"] = (
+            lambda _task:
+                smoke_root
+        )
+
+        print()
+        print("=" * 120)
+        print("ECC FULL-PIPELINE SMOKE TEST")
+        print("=" * 120)
+        print("Dataset :", task["dataset"])
+        print("Model   :", task["model"])
+        print("Epochs  : 1")
+        print("Output  :", smoke_root)
+        print()
+
+        run_dir = run_training(
+            task
+        )
+
+        print()
+        print("=" * 120)
+        print("ECC SMOKE TEST PASSED")
+        print("=" * 120)
+        print("Run directory:", run_dir)
+        print()
+
+    except Exception:
+
+        print()
+        print("=" * 120)
+        print("ECC SMOKE TEST FAILED")
+        print("=" * 120)
+        print()
+        traceback.print_exc()
+        print()
+        print(
+            "FULL 44-JOB SUBMISSION ABORTED because ECC "
+            "cannot yet complete one training epoch."
+        )
+        print()
+
+        raise
+
+    finally:
+
+        EPOCHS = original_epochs
+        PATIENCE = original_patience
+
+        if had_batch_size:
+            BATCH_SIZE = original_batch_size
+
+        globals()["task_result_root"] = (
+            original_task_result_root
+        )
+
+
+def incomplete_task_ids() -> List[int]:
+    missing = []
+
+    for task in all_tasks():
+        complete, _ = validated_task_result(
+            task
+        )
+
+        if not complete:
+            missing.append(
+                task["task_id"]
+            )
+
+    return missing
+
+
+def compact_ids(ids: Sequence[int]) -> str:
+    ids = sorted(set(ids))
+    if not ids:
+        return ""
+
+    pieces = []
+    start = prev = ids[0]
+
+    for value in ids[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+
+        pieces.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = value
+
+    pieces.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(pieces)
+
+
+def _require_python(path: str, label: str) -> str:
+    p = Path(path)
+
+    if not p.is_file():
+        raise SystemExit(
+            f"[ERROR] {label} Python interpreter does not exist:\\n"
+            f"  {path}\\n"
+            "Create that environment first or pass the correct path."
+        )
+
+    return str(
+        p.resolve()
+    )
+
+
+def _routed_resume_worker_script(
+    author_python: str,
+    gnn_python: str,
+) -> str:
+    """
+    One Slurm array, two isolated interpreters.
+
+    The task IDs for author PhyloCNN are deterministic because every dataset
+    contributes the three author models first.
+    """
+    author_ids = [
+        task["task_id"]
+        for task in all_tasks()
+        if task["model"] in AUTHOR_MODELS
+    ]
+
+    author_case = "|".join(
+        str(x)
+        for x in author_ids
+    )
+
+    return (
+        'echo "============================================================"; '
+        'echo "EXPERIMENT 1 ROUTED RESUME"; '
+        'echo "JOB       : $SLURM_JOB_ID"; '
+        'echo "ARRAY TASK: $SLURM_ARRAY_TASK_ID"; '
+        'echo "HOST      : $(hostname)"; '
+        'echo "START     : $(date)"; '
+        'echo "============================================================"; '
+        'nvidia-smi || true; '
+        f'case "$SLURM_ARRAY_TASK_ID" in '
+        f'{author_case}) '
+        f'PYTHON={shlex.quote(author_python)}; '
+        'FAMILY=AUTHOR_PHYLOCNN ;; '
+        '*) '
+        f'PYTHON={shlex.quote(gnn_python)}; '
+        'FAMILY=PHYLOGNN ;; '
+        'esac; '
+        'echo "FAMILY    : $FAMILY"; '
+        'echo "PYTHON    : $PYTHON"; '
+        f'exec "$PYTHON" -u '
+        f'{shlex.quote(str(Path(__file__).resolve()))} '
+        '--worker "$SLURM_ARRAY_TASK_ID"'
+    )
+
+
+def submit(args, resume=False) -> None:
+    apply_runtime_environment()
+    ensure_project_layout()
+    activate_repo_source()
+
+    # -------------------------------------------------------------------------
+    # FRESH RUN
+    #
+    # Never inherit DONE / FAILED markers from a previous array.
+    # Keep expensive prepared caches.
+    # -------------------------------------------------------------------------
+
+    if not resume:
+
+        reset_fresh_submission_state()
+
+        print()
+        print("=" * 120)
+        print("FAST SUBMISSION MODE")
+        print("=" * 120)
+        print("[CACHE] Reusing previously prepared graph/PhyloCNN caches.")
+        print("[SKIP]  Full inspect/prepare preflight.")
+        print("[INFO]  Run --preflight manually only after changing data/source.")
+        print()
+
+        # One real epoch is enough to ensure ECC works before
+        # launching the complete benchmark.
+        print(
+            "[GPU] ECC will be tested inside its Ascher GPU array task."
+        )
+
+    write_task_map()
+    LOGS.mkdir(parents=True, exist_ok=True)
+    RESULTS.mkdir(parents=True, exist_ok=True)
+
+    ids = incomplete_task_ids() if resume else list(range(len(all_tasks())))
+    if not ids:
+        print("[OK] All 44 tasks are already complete.")
+        return
+
+    array_base = compact_ids(ids)
+
+    if (
+        args.max_parallel
+        and
+        int(args.max_parallel) > 0
+    ):
+        array = (
+            f"{array_base}%"
+            f"{int(args.max_parallel)}"
+        )
+    else:
+        array = array_base
+
+    # Workers use exactly the Python interpreter that launched this script.
+    # No `uv run`, no editable build, and no writes to ~/.cache.
+    env_prefix = " ".join(
+        [
+            f"UV_CACHE_DIR={shlex.quote(str(LOCAL_UV_CACHE))}",
+            f"UV_PROJECT_ENVIRONMENT={shlex.quote(str(LOCAL_UV_ENV))}",
+            f"XDG_CACHE_HOME={shlex.quote(str(LOCAL_XDG_CACHE))}",
+            f"TMPDIR={shlex.quote(str(LOCAL_TMP))}",
+            f"MPLCONFIGDIR={shlex.quote(str(LOCAL_XDG_CACHE / 'matplotlib'))}",
+            f"KERAS_HOME={shlex.quote(str(LOCAL_XDG_CACHE / 'keras'))}",
+            f"PYTHONPATH={shlex.quote(os.pathsep.join((str(REPO / 'src'), str(SCRIPT_DIR))))}",
+            "PYTHONUNBUFFERED=1",
+            "TF_CPP_MIN_LOG_LEVEL=2",
+            f"OMP_NUM_THREADS={int(args.cpus)}",
+            f"TF_NUM_INTRAOP_THREADS={int(args.cpus)}",
+            "TF_NUM_INTEROP_THREADS=1",
+        ]
+    )
+
+    if resume:
+        author_needed = any(
+            get_task(task_id)["model"] in AUTHOR_MODELS
+            for task_id in ids
+        )
+
+        gnn_needed = any(
+            get_task(task_id)["model"] in OUR_MODELS
+            for task_id in ids
+        )
+
+        author_python = args.author_python
+        gnn_python = args.gnn_python
+
+        if author_needed:
+            author_python = _require_python(
+                author_python,
+                "AUTHOR PHYLOCNN",
+            )
+
+        if gnn_needed:
+            gnn_python = _require_python(
+                gnn_python,
+                "PHYLOGNN",
+            )
+
+        worker_script = _routed_resume_worker_script(
+            author_python=author_python,
+            gnn_python=gnn_python,
+        )
+
+        print()
+        print("=" * 120)
+        print("ROUTED RESUME")
+        print("=" * 120)
+        print("Incomplete task IDs :", compact_ids(ids))
+        print("Author Python       :", author_python if author_needed else "not needed")
+        print("GNN Python          :", gnn_python if gnn_needed else "not needed")
+        print("Already successful tasks will NOT be rerun.")
+        print()
+
+    else:
+        worker_script = (
+            'echo "============================================================"; '
+            'echo "ASCHER GPU EXPERIMENT 1"; '
+            'echo "JOB       : $SLURM_JOB_ID"; '
+            'echo "ARRAY TASK: $SLURM_ARRAY_TASK_ID"; '
+            'echo "HOST      : $(hostname)"; '
+            'echo "START     : $(date)"; '
+            'echo "============================================================"; '
+            'nvidia-smi; '
+            f'exec {shlex.quote(sys.executable)} -u '
+            f'{shlex.quote(str(Path(__file__).resolve()))} '
+            '--worker $SLURM_ARRAY_TASK_ID'
+        )
+
+    worker_command = (
+        f"env {env_prefix} "
+        "PYTHONUNBUFFERED=1 "
+        "TF_CPP_MIN_LOG_LEVEL=1 "
+        "bash -lc "
+        f"{shlex.quote(worker_script)}"
+    )
+
+
+    cmd = [
+        "sbatch",
+        "--parsable",
+        "--job-name", JOB_NAME,
+        "--array", array,
+        "--partition", args.partition,
+        "--qos", args.qos,
+        "--nodes", "1",
+        "--ntasks", "1",
+        "--cpus-per-task", str(args.cpus),
+        "--mem", args.mem,
+        "--time", args.time,
+        "--chdir", str(SCRIPT_DIR),
+        "--output", str(LOGS / "%x.%A_%a.out"),
+        "--error", str(LOGS / "%x.%A_%a.err"),
+    ]
+
+    if args.gres:
+        cmd += [
+            "--gres",
+            args.gres,
+        ]
+
+    cmd += ["--wrap", worker_command]
+
+    print("=" * 120)
+    print("SUBMIT STEP 3")
+    print("=" * 120)
+    print("Array tasks :", array)
+    print("Task count  :", len(ids))
+    print("Total design: 44 jobs = 4 datasets x 11 models")
+
+    r = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+    job_id = r.stdout.strip().split(";")[0]
+
+    submission = {
+        "submitted": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "job_id": job_id,
+        "array": array,
+        "tasks": len(ids),
+        "partition": args.partition,
+        "qos": args.qos,
+        "cpus": args.cpus,
+        "mem": args.mem,
+        "time": args.time,
+        "gres": args.gres,
+    }
+
+    (STATE / "last_submission.json").write_text(
+        json.dumps(submission, indent=2) + "\n"
+    )
+
+    print("Submitted job :", job_id)
+    print()
+    print("Progress:")
+    print("  python Step3_Experiment1_LimitedTest.py --status")
+
+
+def cancel() -> None:
+    user = os.environ.get("USER")
+    if not user:
+        raise SystemExit("[ERROR] USER environment variable not set")
+
+    r = subprocess.run(
+        ["squeue", "-h", "-u", user, "-n", JOB_NAME, "-o", "%A"],
+        stdout=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+    ids = sorted(
+        set(
+            line.strip().split("_")[0]
+            for line in r.stdout.splitlines()
+            if line.strip()
+        )
+    )
+
+    if not ids:
+        print("[OK] No active Step 3 jobs.")
+        return
+
+    print("Cancelling:", " ".join(ids))
+    subprocess.run(["scancel", *ids], check=False)
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def main():
+    apply_runtime_environment()
+    ensure_project_layout()
+    activate_repo_source()
+
+    p = argparse.ArgumentParser()
+
+    g = p.add_mutually_exclusive_group(required=False)
+    g.add_argument("--plan", action="store_true")
+    g.add_argument("--preflight", action="store_true")
+    g.add_argument("--submit", action="store_true")
+    g.add_argument("--resume", action="store_true")
+    g.add_argument("--status", action="store_true")
+    g.add_argument(
+        "--watch",
+        action="store_true",
+        help="Continuously refresh live epoch/loss/time progress.",
+    )
+    g.add_argument("--aggregate", action="store_true")
+    g.add_argument("--cancel", action="store_true")
+    g.add_argument("--worker", type=int)
+
+    p.add_argument("--workers", type=int, default=8)
+
+    p.add_argument(
+        "--max-parallel",
+        type=int,
+        default=8,
+        help=(
+            "Maximum simultaneous Slurm array tasks. "
+            "All 44 jobs are submitted, but only this many run concurrently. "
+            "Default: 8."
+        ),
+    )
+    p.add_argument(
+        "--watch-seconds",
+        type=int,
+        default=20,
+        help="Refresh interval for --watch (default: 20 seconds).",
+    )
+    p.add_argument("--partition", default="ascher")
+    p.add_argument(
+        "--qos",
+        default="gpu",
+        help="Slurm QoS. Ascher GPU jobs use gpu.",
+    )
+    p.add_argument("--cpus", type=int, default=4)
+    p.add_argument("--mem", default="90G")
+    p.add_argument("--time", default="12:00:00")
+    p.add_argument(
+        "--gres",
+        default="gpu:1",
+        help="Optional Slurm GRES, e.g. gpu:1. Default is CPU/no GRES.",
+    )
+
+    p.add_argument(
+        "--author-python",
+        default=DEFAULT_AUTHOR_PYTHON,
+        help=(
+            "Python interpreter for author PhyloCNN tasks during --resume. "
+            "Default: $PHYLOCNN_AUTHOR_PYTHON or the phylocnn-author env path."
+        ),
+    )
+
+    p.add_argument(
+        "--gnn-python",
+        default=DEFAULT_GNN_PYTHON,
+        help=(
+            "Python interpreter for our GNN tasks during --resume. "
+            "Default: the Python launching this controller."
+        ),
+    )
+
+    args = p.parse_args()
+
+    if not any((
+        args.plan, args.preflight, args.submit, args.resume, args.status,
+        args.watch, args.aggregate, args.cancel, args.worker is not None,
+    )):
+        print("=" * 120)
+        print("PHYLOGNN EXPERIMENT 1 — SELF-CONTAINED CONTROLLER")
+        print("=" * 120)
+        print("Python      :", sys.executable)
+        print("Working dir :", SCRIPT_DIR)
+        print("Source      :", REPO / "src")
+        print("Results     :", RESULTS)
+        print("UV cache    :", LOCAL_UV_CACHE)
+        print("Home uv     : NOT USED")
+        print()
+        print("Commands: --plan --submit --status --watch --resume --aggregate --cancel")
+        print()
+        status()
+        return
+
+    if args.plan:
+        plan()
+    elif args.preflight:
+        preflight(args.workers)
+    elif args.submit:
+        submit(args, resume=False)
+    elif args.resume:
+        submit(args, resume=True)
+    elif args.status:
+        status()
+    elif args.watch:
+        watch_status(
+            args.watch_seconds
+        )
+    elif args.aggregate:
+        aggregate()
+    elif args.cancel:
+        cancel()
+    elif args.worker is not None:
+        worker(args.worker)
+
+
+if __name__ == "__main__":
+    main()
